@@ -2,6 +2,7 @@ package protonmail
 
 import (
 	"bytes"
+	"crypto"
 	"io"
 	"net/http"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 type Contact struct {
@@ -76,6 +78,11 @@ type ContactCard struct {
 
 func NewEncryptedContactCard(r io.Reader, to []*openpgp.Entity, signer *openpgp.Entity) (*ContactCard, error) {
 	// TODO: sign and encrypt at the same time
+	config := &packet.Config{
+		DefaultCipher:          packet.CipherAES256,
+		DefaultCompressionAlgo: packet.CompressionNone,
+		DefaultHash:            crypto.SHA256,
+	}
 
 	var msg, armored bytes.Buffer
 	if signer != nil {
@@ -88,7 +95,7 @@ func NewEncryptedContactCard(r io.Reader, to []*openpgp.Entity, signer *openpgp.
 		return nil, err
 	}
 
-	cleartext, err := openpgp.Encrypt(ciphertext, to, nil, nil, nil)
+	cleartext, err := openpgp.Encrypt(ciphertext, to, nil, nil, config)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +331,7 @@ func (c *Client) CreateContacts(contacts []*ContactImport) ([]*CreateContactResp
 	reqData := struct {
 		Contacts                  []*ContactImport
 		Overwrite, Groups, Labels int
-	}{contacts, 0, 0, 0}
+	}{contacts, 0, 1, 1}
 	req, err := c.newJSONRequest(http.MethodPost, "/contacts", &reqData)
 	if err != nil {
 		return nil, err

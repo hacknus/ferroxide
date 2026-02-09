@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"crypto/sha256"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -16,13 +18,15 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	imapserver "github.com/emersion/go-imap/server"
+	webdavcarddav "github.com/emersion/go-webdav/carddav"
 	"github.com/emersion/go-mbox"
 	"github.com/emersion/go-smtp"
+	"github.com/emersion/go-vcard"
 	"golang.org/x/term"
 
 	"github.com/acheong08/ferroxide/auth"
 	"github.com/acheong08/ferroxide/caldav"
-	"github.com/acheong08/ferroxide/carddav"
+	ferrocarddav "github.com/acheong08/ferroxide/carddav"
 	"github.com/acheong08/ferroxide/config"
 	"github.com/acheong08/ferroxide/events"
 	"github.com/acheong08/ferroxide/exports"
@@ -45,6 +49,7 @@ var (
 	appVersion  string
 	proxyURL    string
 	tor         bool
+	carddavVCardVersion string
 )
 
 func makeHTTPClientFromProxy(proxyArg string) (*http.Client, error) {
@@ -167,7 +172,661 @@ func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, even
 	return s.ListenAndServe()
 }
 
-func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+type propPatchProp struct {
+	Space string
+	Local string
+}
+
+type propfindProp struct {
+	Space string
+	Local string
+}
+
+func parsePropPatchProps(body io.Reader) []propPatchProp {
+	dec := xml.NewDecoder(body)
+	props := make([]propPatchProp, 0)
+	seen := make(map[string]struct{})
+	depth := 0
+	propDepth := -1
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return props
+		}
+
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if strings.EqualFold(t.Name.Local, "prop") {
+				propDepth = depth
+				continue
+			}
+			if propDepth != -1 && depth == propDepth+1 {
+				key := t.Name.Space + "|" + t.Name.Local
+				if _, ok := seen[key]; !ok {
+					props = append(props, propPatchProp{Space: t.Name.Space, Local: t.Name.Local})
+					seen[key] = struct{}{}
+				}
+			}
+		case xml.EndElement:
+			if propDepth != -1 && depth == propDepth && strings.EqualFold(t.Name.Local, "prop") {
+				propDepth = -1
+			}
+			depth--
+		}
+	}
+
+	return props
+}
+
+func parsePropfindProps(body io.Reader) []propfindProp {
+	dec := xml.NewDecoder(body)
+	props := make([]propfindProp, 0)
+	seen := make(map[string]struct{})
+	depth := 0
+	propDepth := -1
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return props
+		}
+
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if strings.EqualFold(t.Name.Local, "prop") {
+				propDepth = depth
+				continue
+			}
+			if propDepth != -1 && depth == propDepth+1 {
+				key := t.Name.Space + "|" + t.Name.Local
+				if _, ok := seen[key]; !ok {
+					props = append(props, propfindProp{Space: t.Name.Space, Local: t.Name.Local})
+					seen[key] = struct{}{}
+				}
+			}
+		case xml.EndElement:
+			if propDepth != -1 && depth == propDepth && strings.EqualFold(t.Name.Local, "prop") {
+				propDepth = -1
+			}
+			depth--
+		}
+	}
+
+	return props
+}
+
+func writePropPatchResponse(resp http.ResponseWriter, req *http.Request) {
+	props := parsePropPatchProps(req.Body)
+
+	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	resp.WriteHeader(http.StatusMultiStatus)
+
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:">`)
+	b.WriteString(`<D:response><D:href>`)
+	_ = xml.EscapeText(&b, []byte(req.URL.Path))
+	b.WriteString(`</D:href><D:propstat><D:prop>`)
+
+	nsPrefix := make(map[string]string)
+	nextIdx := 1
+	for _, p := range props {
+		if p.Local == "" {
+			continue
+		}
+		if p.Space == "" || p.Space == "DAV:" {
+			fmt.Fprintf(&b, "<D:%s/>", p.Local)
+			continue
+		}
+		prefix, ok := nsPrefix[p.Space]
+		if !ok {
+			prefix = fmt.Sprintf("X%d", nextIdx)
+			nextIdx++
+			nsPrefix[p.Space] = prefix
+		}
+		fmt.Fprintf(&b, "<%s:%s xmlns:%s=\"", prefix, p.Local, prefix)
+		_ = xml.EscapeText(&b, []byte(p.Space))
+		b.WriteString("\"/>")
+	}
+
+	b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
+	_, _ = resp.Write(b.Bytes())
+}
+
+func writeRootPropfindResponse(resp http.ResponseWriter, req *http.Request) {
+	const principalPath = "/caldav/"
+	const homeSetPath = "/caldav/calendars/"
+
+	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	resp.WriteHeader(http.StatusMultiStatus)
+
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">`)
+	b.WriteString(`<D:response><D:href>/</D:href><D:propstat><D:prop>`)
+	b.WriteString(`<D:current-user-principal><D:href>`)
+	_ = xml.EscapeText(&b, []byte(principalPath))
+	b.WriteString(`</D:href></D:current-user-principal>`)
+	b.WriteString(`<C:calendar-home-set><D:href>`)
+	_ = xml.EscapeText(&b, []byte(homeSetPath))
+	b.WriteString(`</D:href></C:calendar-home-set>`)
+	b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
+	_, _ = resp.Write(b.Bytes())
+}
+
+const addressbookHomePath = "/contacts/"
+
+func writeRootPropfindResponseCardDAV(resp http.ResponseWriter, req *http.Request) {
+	const principalPath = "/contacts/"
+	const homeSetPath = "/contacts/"
+
+	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	resp.WriteHeader(http.StatusMultiStatus)
+
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">`)
+	b.WriteString(`<D:response><D:href>/</D:href><D:propstat><D:prop>`)
+	b.WriteString(`<D:current-user-principal><D:href>`)
+	_ = xml.EscapeText(&b, []byte(principalPath))
+	b.WriteString(`</D:href></D:current-user-principal>`)
+	b.WriteString(`<C:addressbook-home-set><D:href>`)
+	_ = xml.EscapeText(&b, []byte(homeSetPath))
+	b.WriteString(`</D:href></C:addressbook-home-set>`)
+	b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
+	_, _ = resp.Write(b.Bytes())
+}
+
+func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) {
+	const collectionPath = "/contacts/"
+	const maxResourceSize = 100 * 1024
+
+	_ = backend
+	props := parsePropfindProps(req.Body)
+
+	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	resp.WriteHeader(http.StatusMultiStatus)
+
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/" xmlns:MM="http://me.com/_namespace/" xmlns:ME="urn:mobileme:davservices">`)
+	b.WriteString(`<D:response><D:href>`)
+	_ = xml.EscapeText(&b, []byte(collectionPath))
+	b.WriteString(`</D:href><D:propstat><D:prop>`)
+
+	emitEmpty := func(space, local string) {
+		switch space {
+		case "DAV:":
+			fmt.Fprintf(&b, "<D:%s/>", local)
+		case "urn:ietf:params:xml:ns:carddav":
+			fmt.Fprintf(&b, "<C:%s/>", local)
+		case "http://calendarserver.org/ns/":
+			fmt.Fprintf(&b, "<CS:%s/>", local)
+		case "http://me.com/_namespace/":
+			fmt.Fprintf(&b, "<MM:%s/>", local)
+		case "urn:mobileme:davservices":
+			fmt.Fprintf(&b, "<ME:%s/>", local)
+		default:
+			fmt.Fprintf(&b, "<D:%s/>", local)
+		}
+	}
+
+	for _, p := range props {
+		switch {
+		case p.Space == "DAV:" && p.Local == "resourcetype":
+			b.WriteString(`<D:resourcetype><D:collection/><D:principal/><C:addressbook/></D:resourcetype>`)
+		case p.Space == "DAV:" && p.Local == "displayname":
+			b.WriteString(`<D:displayname>ProtonMail</D:displayname>`)
+		case p.Space == "DAV:" && p.Local == "current-user-principal":
+			b.WriteString(`<D:current-user-principal><D:href>`)
+			_ = xml.EscapeText(&b, []byte(collectionPath))
+			b.WriteString(`</D:href></D:current-user-principal>`)
+		case p.Space == "DAV:" && p.Local == "principal-URL":
+			b.WriteString(`<D:principal-URL><D:href>`)
+			_ = xml.EscapeText(&b, []byte(collectionPath))
+			b.WriteString(`</D:href></D:principal-URL>`)
+		case p.Space == "DAV:" && p.Local == "owner":
+			b.WriteString(`<D:owner><D:href>`)
+			_ = xml.EscapeText(&b, []byte(collectionPath))
+			b.WriteString(`</D:href></D:owner>`)
+		case p.Space == "DAV:" && p.Local == "current-user-privilege-set":
+			b.WriteString(`<D:current-user-privilege-set>`)
+			b.WriteString(`<D:privilege><D:read/></D:privilege>`)
+			b.WriteString(`<D:privilege><D:write/></D:privilege>`)
+			b.WriteString(`<D:privilege><D:write-properties/></D:privilege>`)
+			b.WriteString(`<D:privilege><D:write-content/></D:privilege>`)
+			b.WriteString(`</D:current-user-privilege-set>`)
+		case p.Space == "DAV:" && p.Local == "supported-report-set":
+			b.WriteString(`<D:supported-report-set>`)
+			b.WriteString(`<D:supported-report><D:report><C:addressbook-query/></D:report></D:supported-report>`)
+			b.WriteString(`<D:supported-report><D:report><C:addressbook-multiget/></D:report></D:supported-report>`)
+			b.WriteString(`<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>`)
+			b.WriteString(`</D:supported-report-set>`)
+		case p.Space == "DAV:" && p.Local == "sync-token":
+			b.WriteString(`<D:sync-token>0</D:sync-token>`)
+		case p.Space == "DAV:" && p.Local == "add-member":
+			b.WriteString(`<D:add-member><D:href>`)
+			_ = xml.EscapeText(&b, []byte(collectionPath))
+			b.WriteString(`</D:href></D:add-member>`)
+		case p.Space == "DAV:" && p.Local == "quota-available-bytes":
+			b.WriteString(`<D:quota-available-bytes>0</D:quota-available-bytes>`)
+		case p.Space == "DAV:" && p.Local == "quota-used-bytes":
+			b.WriteString(`<D:quota-used-bytes>0</D:quota-used-bytes>`)
+		case p.Space == "DAV:" && p.Local == "resource-id":
+			b.WriteString(`<D:resource-id>contacts</D:resource-id>`)
+		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "addressbook-home-set":
+			b.WriteString(`<C:addressbook-home-set><D:href>`)
+			_ = xml.EscapeText(&b, []byte(collectionPath))
+			b.WriteString(`</D:href></C:addressbook-home-set>`)
+		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "supported-address-data":
+			b.WriteString(`<C:supported-address-data><C:address-data-type content-type="text/vcard" version="`)
+			_ = xml.EscapeText(&b, []byte(carddavVCardVersion))
+			b.WriteString(`"/></C:supported-address-data>`)
+		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "max-resource-size":
+			fmt.Fprintf(&b, "<C:max-resource-size>%d</C:max-resource-size>", maxResourceSize)
+		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "max-image-size":
+			b.WriteString(`<C:max-image-size>0</C:max-image-size>`)
+		case p.Space == "urn:mobileme:davservices" && p.Local == "quota-available":
+			b.WriteString(`<ME:quota-available>0</ME:quota-available>`)
+		case p.Space == "urn:mobileme:davservices" && p.Local == "quota-used":
+			b.WriteString(`<ME:quota-used>0</ME:quota-used>`)
+		default:
+			emitEmpty(p.Space, p.Local)
+		}
+	}
+
+	b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
+	_, _ = resp.Write(b.Bytes())
+}
+
+func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) {
+	body, _ := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(body))
+
+	report := parseCarddavReport(body)
+	if report.reportType == "" {
+		reqType := strings.ToLower(string(body))
+		if strings.Contains(reqType, "sync-collection") {
+			report.reportType = "sync-collection"
+		}
+	}
+	if !report.wantAddressData && !report.wantETag {
+		report.wantETag = true
+	}
+	if debug {
+		log.Printf("carddav/report: path=%s type=%s hrefs=%d wantEtag=%t wantData=%t syncToken=%q body=%q", req.URL.Path, report.reportType, len(report.hrefs), report.wantETag, report.wantAddressData, report.syncToken, string(body))
+	}
+
+	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	resp.WriteHeader(http.StatusMultiStatus)
+
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">`)
+
+	logCards := debug && (report.reportType == "addressbook-multiget" || report.reportType == "sync-collection")
+	loggedCard := false
+	writeObjectResponse := func(obj *webdavcarddav.AddressObject) {
+		var cardBuf bytes.Buffer
+		card := cloneVCard(obj.Card)
+		normalizeVCardVersion(card, carddavVCardVersion)
+		if report.wantAddressData {
+			if err := vcard.NewEncoder(&cardBuf).Encode(card); err != nil {
+				return
+			}
+			if carddavVCardVersion == "3.0" {
+				data := cardBuf.String()
+				data = strings.ReplaceAll(data, "VERSION:4.0", "VERSION:3.0")
+				cardBuf.Reset()
+				cardBuf.WriteString(data)
+				if debug && strings.Contains(data, "VERSION:4.0") {
+					log.Printf("carddav/report: warning vCard version replace failed for %s", obj.Path)
+				}
+			}
+			if logCards && !loggedCard {
+				data := cardBuf.String()
+				if len(data) > 300 {
+					data = data[:300] + "..."
+				}
+				log.Printf("carddav/report: address-data path=%s bytes=%d sample=%q", obj.Path, cardBuf.Len(), data)
+				loggedCard = true
+			}
+		}
+
+		b.WriteString(`<D:response><D:href>`)
+		_ = xml.EscapeText(&b, []byte(obj.Path))
+		b.WriteString(`</D:href><D:propstat><D:prop>`)
+		if report.wantETag {
+			b.WriteString(`<D:getetag>`)
+			_ = xml.EscapeText(&b, []byte(`"`+obj.ETag+`"`))
+			b.WriteString(`</D:getetag>`)
+		}
+		if report.wantAddressData {
+			b.WriteString(`<C:address-data content-type="text/vcard" version="`)
+			_ = xml.EscapeText(&b, []byte(carddavVCardVersion))
+			b.WriteString(`">`)
+			_ = xml.EscapeText(&b, cardBuf.Bytes())
+			b.WriteString(`</C:address-data>`)
+		}
+		b.WriteString(`</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`)
+	}
+
+	var syncToken string
+	var objects []webdavcarddav.AddressObject
+	switch report.reportType {
+	case "addressbook-multiget":
+		for _, href := range report.hrefs {
+			path := href
+			if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+				if u, err := url.Parse(path); err == nil {
+					path = u.Path
+				}
+			}
+			if !strings.HasPrefix(path, "/") {
+				path = "/contacts/" + strings.TrimPrefix(path, "contacts/")
+			}
+			obj, err := backend.GetAddressObject(req.Context(), path, &webdavcarddav.AddressDataRequest{AllProp: true})
+			if err != nil {
+				b.WriteString(`<D:response><D:href>`)
+				_ = xml.EscapeText(&b, []byte(path))
+				b.WriteString(`</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>`)
+				continue
+			}
+			writeObjectResponse(obj)
+		}
+	default:
+		var err error
+		objects, err = backend.ListAddressObjects(req.Context(), "/contacts/", &webdavcarddav.AddressDataRequest{AllProp: true})
+		if err != nil {
+			resp.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if debug {
+			log.Printf("carddav/report: returned %d contacts", len(objects))
+		}
+		if report.reportType == "addressbook-query" {
+			// Ensure Apple receives full vCards even if it only requested ETags.
+			report.wantAddressData = true
+		}
+		if report.reportType == "sync-collection" {
+			type syncTokenManager interface {
+				IsSyncTokenValid(token string) bool
+				RememberSyncToken(token string)
+			}
+
+			validToken := false
+			if mgr, ok := backend.(syncTokenManager); ok {
+				validToken = mgr.IsSyncTokenValid(report.syncToken)
+			}
+			// Apple Contacts doesn't always follow up with addressbook-multiget,
+			// so include full address-data in sync-collection responses.
+			report.wantAddressData = true
+
+			h := sha256.New()
+			for _, obj := range objects {
+				_, _ = h.Write([]byte(obj.Path))
+				_, _ = h.Write([]byte(obj.ETag))
+			}
+			if len(objects) == 0 {
+				syncToken = "token-empty"
+			} else {
+				syncToken = fmt.Sprintf("token-%x", h.Sum(nil))
+			}
+			if mgr, ok := backend.(syncTokenManager); ok {
+				mgr.RememberSyncToken(syncToken)
+			}
+			if report.syncToken != "" && validToken && report.syncToken == syncToken {
+				objects = nil
+			}
+			if debug {
+				log.Printf("carddav/report: sync-collection tokenValid=%t forceData=%t", validToken, report.wantAddressData)
+			}
+		}
+		if debug {
+			log.Printf("carddav/report: writing %d responses wantData=%t wantEtag=%t", len(objects), report.wantAddressData, report.wantETag)
+		}
+		for i := range objects {
+			obj := objects[i]
+			writeObjectResponse(&obj)
+		}
+	}
+
+	if report.reportType == "sync-collection" {
+		if syncToken == "" {
+			syncToken = "token-empty"
+		}
+		b.WriteString(`<D:sync-token>`)
+		_ = xml.EscapeText(&b, []byte(syncToken))
+		b.WriteString(`</D:sync-token>`)
+	}
+
+	b.WriteString(`</D:multistatus>`)
+	_, _ = resp.Write(b.Bytes())
+}
+
+type carddavReport struct {
+	reportType      string
+	wantETag        bool
+	wantAddressData bool
+	hrefs           []string
+	syncToken       string
+}
+
+func parseCarddavReport(body []byte) carddavReport {
+	var r carddavReport
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch {
+		case start.Name.Space == "DAV:" && start.Name.Local == "sync-collection":
+			r.reportType = "sync-collection"
+		case start.Name.Space == "urn:ietf:params:xml:ns:carddav" && start.Name.Local == "addressbook-multiget":
+			r.reportType = "addressbook-multiget"
+		case start.Name.Space == "urn:ietf:params:xml:ns:carddav" && start.Name.Local == "addressbook-query":
+			r.reportType = "addressbook-query"
+		case start.Name.Space == "DAV:" && start.Name.Local == "getetag":
+			r.wantETag = true
+		case start.Name.Space == "urn:ietf:params:xml:ns:carddav" && start.Name.Local == "address-data":
+			r.wantAddressData = true
+		case start.Name.Space == "DAV:" && start.Name.Local == "href":
+			var href string
+			if err := dec.DecodeElement(&href, &start); err == nil {
+				href = strings.TrimSpace(href)
+				if href != "" {
+					r.hrefs = append(r.hrefs, href)
+				}
+			}
+		case start.Name.Space == "DAV:" && start.Name.Local == "sync-token":
+			var token string
+			if err := dec.DecodeElement(&token, &start); err == nil {
+				r.syncToken = strings.TrimSpace(token)
+			}
+		}
+	}
+	return r
+}
+
+func cloneVCard(card vcard.Card) vcard.Card {
+	out := make(vcard.Card, len(card))
+	for k, fields := range card {
+		copied := make([]*vcard.Field, len(fields))
+		copy(copied, fields)
+		out[k] = copied
+	}
+	return out
+}
+
+func normalizeVCardVersion(card vcard.Card, version string) {
+	if version == "4.0" {
+		vcard.ToV4(card)
+		return
+	}
+	// Fall back to a minimal vCard 3.0 conversion.
+	// We keep existing fields but rewrite VERSION explicitly.
+	card[vcard.FieldVersion] = []*vcard.Field{{Value: "3.0"}}
+
+	// Ensure FN exists; use EMAIL or UID as a fallback display name.
+	if fields, ok := card[vcard.FieldFormattedName]; !ok || len(fields) == 0 {
+		name := ""
+		if emailFields, ok := card[vcard.FieldEmail]; ok && len(emailFields) > 0 {
+			name = emailFields[0].Value
+		} else if uidFields, ok := card[vcard.FieldUID]; ok && len(uidFields) > 0 {
+			name = uidFields[0].Value
+		}
+		if name != "" {
+			card[vcard.FieldFormattedName] = []*vcard.Field{{Value: name}}
+		}
+	}
+
+	// Ensure N exists for vCard 3.0.
+	if fields, ok := card[vcard.FieldName]; !ok || len(fields) == 0 {
+		family := ""
+		given := ""
+		if fnFields, ok := card[vcard.FieldFormattedName]; ok && len(fnFields) > 0 {
+			parts := strings.Fields(fnFields[0].Value)
+			if len(parts) > 1 {
+				family = parts[len(parts)-1]
+				given = strings.Join(parts[:len(parts)-1], " ")
+			} else if len(parts) == 1 {
+				family = parts[0]
+			}
+		}
+		card[vcard.FieldName] = []*vcard.Field{{Value: fmt.Sprintf("%s;%s;;;", family, given)}}
+	}
+
+	// Convert PREF parameters to TYPE=PREF for vCard 3.0 compatibility.
+	for _, fields := range card {
+		for _, f := range fields {
+			if f == nil || f.Params == nil {
+				continue
+			}
+			prefVals, ok := f.Params["PREF"]
+			if !ok || len(prefVals) == 0 {
+				continue
+			}
+			pref := false
+			for _, v := range prefVals {
+				if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+					pref = true
+					break
+				}
+			}
+			delete(f.Params, "PREF")
+			if pref {
+				types := f.Params["TYPE"]
+				found := false
+				for _, t := range types {
+					if strings.EqualFold(t, "PREF") {
+						found = true
+						break
+					}
+				}
+				if !found {
+					types = append(types, "PREF")
+				}
+				f.Params["TYPE"] = types
+			}
+			if len(f.Params) == 0 {
+				f.Params = nil
+			}
+		}
+	}
+}
+
+func parseStringFlag(args []string, name string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == name {
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		}
+		if strings.HasPrefix(arg, name+"=") {
+			return strings.TrimPrefix(arg, name+"="), true
+		}
+	}
+	return "", false
+}
+
+func handleCarddavPost(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) int {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		resp.WriteHeader(http.StatusBadRequest)
+		return http.StatusBadRequest
+	}
+	_ = req.Body.Close()
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		resp.WriteHeader(http.StatusBadRequest)
+		return http.StatusBadRequest
+	}
+
+	card, err := vcard.NewDecoder(bytes.NewReader(body)).Decode()
+	if err != nil {
+		resp.WriteHeader(http.StatusBadRequest)
+		return http.StatusBadRequest
+	}
+
+	id := uuid.New().String()
+	path := "/contacts/" + id + ".vcf"
+	ao, err := backend.PutAddressObject(req.Context(), path, card, nil)
+	if err != nil {
+		if debug {
+			log.Printf("carddav/post: failed to create contact: %v", err)
+		}
+		resp.WriteHeader(http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+
+	if debug {
+		log.Printf("carddav/post: created contact path=%s etag=%s", ao.Path, ao.ETag)
+	}
+
+	resp.Header().Set("Location", ao.Path)
+	resp.Header().Set("ETag", `"`+ao.ETag+`"`)
+	resp.WriteHeader(http.StatusCreated)
+	return http.StatusCreated
+}
+
+func listenAndServeCalDAV(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
 	s := &http.Server{
@@ -203,6 +862,27 @@ func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager 
 				handlers[username] = h
 			}
 
+			if req.Method == "PROPPATCH" {
+				writePropPatchResponse(resp, req)
+				return
+			}
+
+			if req.Method == "PROPFIND" && req.URL.Path == "/" {
+				writeRootPropfindResponse(resp, req)
+				return
+			}
+
+			if debug {
+				rec := &statusRecorder{ResponseWriter: resp}
+				h.ServeHTTP(rec, req)
+				status := rec.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				log.Printf("caldav/http: %s %s -> %d", req.Method, req.URL.Path, status)
+				return
+			}
+
 			h.ServeHTTP(resp, req)
 		}),
 	}
@@ -211,7 +891,7 @@ func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager 
 	return s.ListenAndServe()
 }
 
-func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
+func listenAndServeCardDAV(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
 	s := &http.Server{
@@ -219,6 +899,16 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 		TLSConfig: tlsConfig,
 		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 			resp.Header().Set("WWW-Authenticate", "Basic")
+
+			if req.URL.Path == "/.well-known/carddav" {
+				http.Redirect(resp, req, "/contacts/", http.StatusPermanentRedirect)
+				return
+			}
+
+			if debug {
+				hasAuth := req.Header.Get("Authorization") != ""
+				log.Printf("carddav/http: %s %s (auth=%t ua=%q)", req.Method, req.URL.Path, hasAuth, req.UserAgent())
+			}
 
 			username, password, ok := req.BasicAuth()
 			if !ok {
@@ -242,9 +932,87 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 			if !ok {
 				ch := make(chan *protonmail.Event)
 				eventsManager.Register(c, username, ch, nil)
-				h = carddav.NewHandler(c, privateKeys, ch)
+				h = ferrocarddav.NewHandler(c, privateKeys, ch, carddavVCardVersion)
 
 				handlers[username] = h
+			}
+
+			if req.URL.Path == "/contacts" {
+				req.URL.Path = "/contacts/"
+			}
+			// Map legacy principal paths to the addressbook collection.
+			if strings.HasPrefix(req.URL.Path, "/principals/") {
+				req.URL.Path = "/contacts/"
+			}
+			if strings.HasPrefix(req.URL.Path, "/contacts/default/") {
+				req.URL.Path = "/contacts/" + strings.TrimPrefix(req.URL.Path, "/contacts/default/")
+			} else if req.URL.Path == "/contacts/default" {
+				req.URL.Path = "/contacts/"
+			}
+
+			if req.Method == "PROPPATCH" {
+				writePropPatchResponse(resp, req)
+				return
+			}
+
+			if req.Method == "PROPFIND" && req.URL.Path == "/" {
+				writeRootPropfindResponseCardDAV(resp, req)
+				return
+			}
+
+			if req.Method == "PROPFIND" && req.URL.Path == "/contacts/" {
+				if handler, ok := h.(*webdavcarddav.Handler); ok {
+					writeContactsPropfindResponse(resp, req, handler.Backend)
+					if debug {
+						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, http.StatusMultiStatus)
+					}
+					return
+				}
+				writeContactsPropfindResponse(resp, req, nil)
+				if debug {
+					log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, http.StatusMultiStatus)
+				}
+				return
+			}
+
+			if req.Method == "REPORT" && (req.URL.Path == "/contacts/" || req.URL.Path == "/contacts/default/") {
+				handler, ok := h.(*webdavcarddav.Handler)
+				if ok {
+					writeCarddavReportResponse(resp, req, handler.Backend)
+					if debug {
+						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, http.StatusMultiStatus)
+					}
+					return
+				}
+			}
+
+			if req.Method == "POST" && (req.URL.Path == "/contacts/" || req.URL.Path == "/contacts/default/") {
+				handler, ok := h.(*webdavcarddav.Handler)
+				if ok {
+					status := handleCarddavPost(resp, req, handler.Backend)
+					if debug {
+						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, status)
+					}
+					return
+				}
+			}
+
+			if debug && req.Method == "PROPFIND" {
+				body, _ := io.ReadAll(req.Body)
+				_ = req.Body.Close()
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				log.Printf("carddav/propfind: path=%s depth=%s body=%q", req.URL.Path, req.Header.Get("Depth"), string(body))
+			}
+
+			if debug {
+				rec := &statusRecorder{ResponseWriter: resp}
+				h.ServeHTTP(rec, req)
+				status := rec.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, status)
+				return
 			}
 
 			h.ServeHTTP(resp, req)
@@ -252,11 +1020,11 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 	}
 
 	if s.TLSConfig != nil {
-		log.Println("CardDAV server listening with TLS on", s.Addr)
+		log.Printf("CardDAV server listening with TLS on %s (vCard %s)", s.Addr, carddavVCardVersion)
 		return s.ListenAndServeTLS("", "")
 	}
 
-	log.Println("CardDAV server listening on", s.Addr)
+	log.Printf("CardDAV server listening on %s (vCard %s)", s.Addr, carddavVCardVersion)
 	return s.ListenAndServe()
 }
 
@@ -303,6 +1071,7 @@ func main() {
 
 	carddavHost := flag.String("carddav-host", "127.0.0.1", "Allowed CardDAV email hostname on which ferroxide listens, defaults to 127.0.0.1")
 	carddavPort := flag.String("carddav-port", "8080", "CardDAV port on which ferroxide listens, defaults to 8080")
+	carddavVCardVersionFlag := flag.String("carddav-vcard-version", "4.0", "CardDAV vCard version to serve (3.0 or 4.0)")
 	disableCardDAV := flag.Bool("disable-carddav", false, "Disable CardDAV for ferroxide serve")
 
 	caldavHost := flag.String("caldav-host", "127.0.0.1", "Allowed CalDAV email hostname on which ferroxide listens, defaults to 127.0.0.1")
@@ -330,6 +1099,14 @@ func main() {
 	}
 
 	flag.Parse()
+	carddavVCardVersion = strings.TrimSpace(*carddavVCardVersionFlag)
+	if v, ok := parseStringFlag(os.Args, "--carddav-vcard-version"); ok {
+		carddavVCardVersion = strings.TrimSpace(v)
+	}
+	if carddavVCardVersion != "3.0" && carddavVCardVersion != "4.0" {
+		log.Printf("carddav: unsupported vCard version %q, defaulting to 4.0", carddavVCardVersion)
+		carddavVCardVersion = "4.0"
+	}
 
 	if tor && proxyURL == "" {
 		log.Fatal("Need -proxy to connect to ProtonMail over Tor")
@@ -591,12 +1368,12 @@ func main() {
 		addr := *caldavHost + ":" + *caldavPort
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
-		log.Fatal(listenAndServeCalDAV(addr, authManager, eventsManager, tlsConfig))
+		log.Fatal(listenAndServeCalDAV(addr, debug, authManager, eventsManager, tlsConfig))
 	case "carddav":
 		addr := *carddavHost + ":" + *carddavPort
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
-		log.Fatal(listenAndServeCardDAV(addr, authManager, eventsManager, tlsConfig))
+		log.Fatal(listenAndServeCardDAV(addr, debug, authManager, eventsManager, tlsConfig))
 	case "serve":
 		smtpAddr := *smtpHost + ":" + *smtpPort
 		imapAddr := *imapHost + ":" + *imapPort
@@ -619,12 +1396,12 @@ func main() {
 		}
 		if !*disableCardDAV {
 			go func() {
-				done <- listenAndServeCardDAV(carddavAddr, authManager, eventsManager, tlsConfig)
+				done <- listenAndServeCardDAV(carddavAddr, debug, authManager, eventsManager, tlsConfig)
 			}()
 		}
 		if !*disableCalDAV {
 			go func() {
-				done <- listenAndServeCalDAV(caldavAddr, authManager, eventsManager, tlsConfig)
+				done <- listenAndServeCalDAV(caldavAddr, debug, authManager, eventsManager, tlsConfig)
 			}()
 		}
 		log.Fatal(<-done)

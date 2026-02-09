@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -721,6 +723,129 @@ func signPart(part string, signer *openpgp.Entity, config *packet.Config) (strin
 	return signatureBuf.String(), nil
 }
 
+func parseICalDateTimeValue(value string, loc *time.Location) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	if strings.HasSuffix(value, "Z") {
+		t, err := time.Parse("20060102T150405Z", value)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	if len(value) == 15 && value[8] == 'T' {
+		t, err := time.ParseInLocation("20060102T150405", value, loc)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	if len(value) == 8 {
+		t, err := time.ParseInLocation("20060102", value, loc)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func firstParam(params ical.Params, name string) string {
+	if params == nil {
+		return ""
+	}
+	if values, ok := params[name]; ok && len(values) > 0 {
+		return values[0]
+	}
+	upper := strings.ToUpper(name)
+	if values, ok := params[upper]; ok && len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+func eventStartTime(event *ical.Event) (time.Time, bool) {
+	if event == nil {
+		return time.Time{}, false
+	}
+	dtstart := event.Props.Get("DTSTART")
+	if dtstart == nil {
+		return time.Time{}, false
+	}
+
+	loc := time.UTC
+	if tzid := firstParam(dtstart.Params, "TZID"); tzid != "" {
+		if l, err := time.LoadLocation(tzid); err == nil {
+			loc = l
+		}
+	}
+
+	return parseICalDateTimeValue(strings.TrimSpace(dtstart.Value), loc)
+}
+
+func normalizeDurationValue(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if strings.HasPrefix(value, "+") {
+		value = strings.TrimPrefix(value, "+")
+	}
+	if strings.HasPrefix(value, "P") || strings.HasPrefix(value, "-P") {
+		return value, true
+	}
+	return "", false
+}
+
+func formatDuration(d time.Duration) string {
+	neg := d < 0
+	if neg {
+		d = -d
+	}
+
+	totalSeconds := int64(d.Seconds())
+	days := totalSeconds / 86400
+	totalSeconds %= 86400
+	hours := totalSeconds / 3600
+	totalSeconds %= 3600
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+
+	var b strings.Builder
+	if neg {
+		b.WriteString("-")
+	}
+	b.WriteString("P")
+	if days > 0 {
+		fmt.Fprintf(&b, "%dD", days)
+	}
+	if hours > 0 || minutes > 0 || seconds > 0 {
+		b.WriteString("T")
+	}
+	if hours > 0 {
+		fmt.Fprintf(&b, "%dH", hours)
+	}
+	if minutes > 0 {
+		fmt.Fprintf(&b, "%dM", minutes)
+	}
+	if seconds > 0 {
+		fmt.Fprintf(&b, "%dS", seconds)
+	}
+
+	out := b.String()
+	if out == "P" || out == "-P" {
+		if neg {
+			return "-PT0S"
+		}
+		return "PT0S"
+	}
+	return out
+}
+
 func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical.Event, userKr openpgp.KeyRing) (*CalendarEventCreateOrUpdateData, string, error) {
 	isCreate := oldEvent == nil
 
@@ -753,6 +878,7 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		data.Color = &color.Value
 	}
 
+	startTime, hasStart := eventStartTime(&event)
 	notifications := make([]CalendarNotification, 0)
 	for _, child := range event.Children {
 		if child.Name != ical.CompAlarm {
@@ -765,7 +891,29 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		notification.Type = ValarmActionToCalendarNotificationType(action.Value)
 
 		trigger := child.Props.Get("TRIGGER")
-		notification.Trigger = trigger.Value
+		if trigger == nil {
+			continue
+		}
+
+		if normalized, ok := normalizeDurationValue(trigger.Value); ok {
+			notification.Trigger = normalized
+		} else if hasStart {
+			// Convert absolute trigger times to a duration relative to DTSTART.
+			if triggerTime, ok := parseICalDateTimeValue(strings.TrimSpace(trigger.Value), time.UTC); ok {
+				delta := triggerTime.Sub(startTime)
+				maxAbs := 365 * 24 * time.Hour
+				if delta <= maxAbs && delta >= -maxAbs {
+					notification.Trigger = formatDuration(delta)
+				}
+			}
+		}
+
+		if notification.Trigger == "" {
+			if c.Debug {
+				log.Printf("makeUpdateData: skipping unsupported trigger value %q", trigger.Value)
+			}
+			continue
+		}
 
 		notifications = append(notifications, notification)
 	}
@@ -889,12 +1037,18 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 }
 
 func (c *Client) UpdateCalendarEvent(calID string, eventID string, event ical.Event, userKr openpgp.KeyRing) (*CalendarEvent, error) {
-	oldEvent, err := c.GetCalendarEvent(calID, eventID)
+	var oldEvent *CalendarEvent
 	isCreate := false
-	if apiErr, ok := err.(*APIError); ok && apiErr.Code == 2061 {
+	if eventID == "" {
 		isCreate = true
-	} else if err != nil {
-		return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
+	} else {
+		var err error
+		oldEvent, err = c.GetCalendarEvent(calID, eventID)
+		if apiErr, ok := err.(*APIError); ok && apiErr.Code == 2061 {
+			isCreate = true
+		} else if err != nil {
+			return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
+		}
 	}
 
 	data, memberID, err := makeUpdateData(c, calID, oldEvent, event, userKr)
@@ -941,7 +1095,24 @@ func (c *Client) UpdateCalendarEvent(calID string, eventID string, event ical.Ev
 		return nil, fmt.Errorf("UpdateCalendarEvent: could not send JSON request: (%w)", err)
 	}
 
-	if len(respData.Responses) != 1 || respData.Responses[0].Response.Event == nil {
+	if c.Debug {
+		if err := respData.Err(); err != nil {
+			log.Printf("UpdateCalendarEvent: top-level sync error: %v", err)
+		}
+	}
+
+	if len(respData.Responses) != 1 {
+		return nil, fmt.Errorf("UpdateCalendarEvent: unexpected number of responses: %d", len(respData.Responses))
+	}
+
+	if err := respData.Responses[0].Response.Err(); err != nil {
+		if c.Debug {
+			log.Printf("UpdateCalendarEvent: sync response error: %v", err)
+		}
+		return nil, fmt.Errorf("UpdateCalendarEvent: sync response error: %w", err)
+	}
+
+	if respData.Responses[0].Response.Event == nil {
 		return nil, fmt.Errorf("UpdateCalendarEvent: no event on events sync response")
 	}
 

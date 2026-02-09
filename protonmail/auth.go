@@ -347,7 +347,8 @@ func (c *Client) Unlock(auth *Auth, keySalts map[string][]byte, passphrase strin
 		return nil, err
 	}
 
-	var keyRing openpgp.EntityList
+	keyRing := make(openpgp.EntityList, 0, len(userKeyRing))
+	keyRing = append(keyRing, userKeyRing...)
 	for _, addr := range addrs {
 		addrKeyRing, err := unlockKeyRing(addr.Keys, userKeyRing, keySalts, []byte(passphrase))
 		if err != nil {
