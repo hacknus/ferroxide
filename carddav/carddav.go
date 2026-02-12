@@ -489,7 +489,11 @@ func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Conta
 
 	card := make(vcard.Card)
 	for _, c := range contact.Cards {
-		md, err := c.Read(b.privateKeys)
+		keyring := b.verifyKeys
+		if len(keyring) == 0 {
+			keyring = b.privateKeys
+		}
+		md, err := c.Read(keyring)
 		if err != nil {
 			return nil, err
 		}
@@ -548,6 +552,7 @@ type backend struct {
 	locker      sync.Mutex
 	total       int
 	privateKeys openpgp.EntityList
+	verifyKeys  openpgp.EntityList
 	encryptKeys     openpgp.EntityList
 	encryptKeysUser openpgp.EntityList
 	encryptKeysAddr openpgp.EntityList
@@ -687,7 +692,11 @@ func (b *backend) rebuildUIDCache(ctx context.Context) error {
 		for _, contactExport := range exports {
 			card := make(vcard.Card)
 			for _, c := range contactExport.Cards {
-				md, err := c.Read(b.privateKeys)
+				keyring := b.verifyKeys
+				if len(keyring) == 0 {
+					keyring = b.privateKeys
+				}
+				md, err := c.Read(keyring)
 				if err != nil {
 					continue
 				}
@@ -1163,7 +1172,9 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, events <-c
 		log.Printf("carddav: warning: failed to fetch user keys for encryption: %v", err)
 	}
 
-	if addrs, err := c.ListAddresses(); err == nil {
+	var addrs []*protonmail.Address
+	if addrList, err := c.ListAddresses(); err == nil {
+		addrs = addrList
 		for _, addr := range addrs {
 			if len(addr.Keys) > 0 {
 				for _, key := range addr.Keys {
@@ -1225,11 +1236,37 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, events <-c
 		}
 	}
 
+	verifyKeys := make(openpgp.EntityList, 0, len(privateKeys))
+	verifyKeys = append(verifyKeys, privateKeys...)
+	if len(addrs) > 0 {
+		for _, addr := range addrs {
+			if addr == nil {
+				continue
+			}
+			email := strings.TrimSpace(addr.Email)
+			if email == "" {
+				continue
+			}
+			pub, err := c.GetPublicKeys(email)
+			if err != nil {
+				continue
+			}
+			for _, key := range pub.Keys {
+				entity, err := key.Entity()
+				if err != nil {
+					continue
+				}
+				verifyKeys = append(verifyKeys, entity)
+			}
+		}
+	}
+
 	b := &backend{
 		c:               c,
 		cache:           make(map[string]*protonmail.Contact),
 		total:           -1,
 		privateKeys:     privateKeys,
+		verifyKeys:      verifyKeys,
 		encryptKeys:     encryptKeys,
 		encryptKeysUser: encryptKeysUser,
 		encryptKeysAddr: encryptKeysAddr,

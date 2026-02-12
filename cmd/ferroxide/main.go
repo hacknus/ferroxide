@@ -369,19 +369,6 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 	const collectionPath = "/contacts/"
 
 	props := parsePropfindProps(req.Body)
-	needSyncToken := false
-	for _, p := range props {
-		if p.Space == "DAV:" && p.Local == "sync-token" {
-			needSyncToken = true
-			break
-		}
-	}
-	syncToken := ""
-	if needSyncToken && backend != nil {
-		if objects, err := backend.ListAddressObjects(req.Context(), collectionPath, &webdavcarddav.AddressDataRequest{AllProp: true}); err == nil {
-			syncToken = syncTokenFromObjects(objects)
-		}
-	}
 
 	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	resp.WriteHeader(http.StatusMultiStatus)
@@ -442,13 +429,7 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 			b.WriteString(`<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>`)
 			b.WriteString(`</D:supported-report-set>`)
 		case p.Space == "DAV:" && p.Local == "sync-token":
-			token := syncToken
-			if token == "" {
-				token = "0"
-			}
-			b.WriteString(`<D:sync-token>`)
-			_ = xml.EscapeText(&b, []byte(token))
-			b.WriteString(`</D:sync-token>`)
+			b.WriteString(`<D:sync-token>0</D:sync-token>`)
 		case p.Space == "DAV:" && p.Local == "add-member":
 			b.WriteString(`<D:add-member><D:href>`)
 			_ = xml.EscapeText(&b, []byte(collectionPath))
