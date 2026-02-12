@@ -41,6 +41,8 @@ const (
 	defaultAPIEndpoint = "https://mail.proton.me/api"
 	torAPIEndpoint     = "https://mail.protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion/api"
 	defaultAppVersion  = "Other"
+	carddavMaxResourceSize = 100 * 1024
+	carddavMaxReportSize   = 1 * 1024 * 1024
 )
 
 var (
