@@ -302,7 +302,7 @@ func (card *CalendarEventCard) Read(userKr openpgp.KeyRing, calKr openpgp.KeyRin
 	if card.Type.Signed() {
 		r := &detachedSignatureReader{
 			md:        md,
-			signature: strings.NewReader(card.Signature),
+			signature: card.Signature,
 			keyring:   userKr,
 		}
 		r.body = io.TeeReader(md.UnverifiedBody, &r.signed)
