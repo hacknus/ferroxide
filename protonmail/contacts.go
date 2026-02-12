@@ -3,6 +3,7 @@ package protonmail
 import (
 	"bytes"
 	"crypto"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -146,7 +147,7 @@ type detachedSignatureReader struct {
 	md        *openpgp.MessageDetails
 	body      io.Reader
 	signed    bytes.Buffer
-	signature io.Reader
+	signature string
 	keyring   openpgp.KeyRing
 	eof       bool
 }
@@ -157,7 +158,7 @@ func (r *detachedSignatureReader) Read(p []byte) (n int, err error) {
 	n, err = r.body.Read(p)
 	if err == io.EOF && !r.eof {
 		// Check signature
-		signer, signatureError := openpgp.CheckArmoredDetachedSignature(r.keyring, &r.signed, r.signature, nil)
+		signer, signatureError := checkContactSignature(r.keyring, r.signed.Bytes(), r.signature)
 		r.md.IsSigned = true
 		r.md.SignatureError = signatureError
 		if signer != nil {
@@ -181,9 +182,7 @@ func (card *ContactCard) Read(keyring openpgp.KeyRing) (*openpgp.MessageDetails,
 			return md, nil
 		}
 
-		signed := strings.NewReader(card.Data)
-		signature := strings.NewReader(card.Signature)
-		signer, err := openpgp.CheckArmoredDetachedSignature(keyring, signed, signature, nil)
+		signer, err := checkContactSignature(keyring, []byte(card.Data), card.Signature)
 		md.IsSigned = true
 		md.SignatureError = err
 		if signer != nil {
@@ -206,7 +205,7 @@ func (card *ContactCard) Read(keyring openpgp.KeyRing) (*openpgp.MessageDetails,
 	if card.Type.Signed() {
 		r := &detachedSignatureReader{
 			md:        md,
-			signature: strings.NewReader(card.Signature),
+			signature: card.Signature,
 			keyring:   keyring,
 		}
 		r.body = io.TeeReader(md.UnverifiedBody, &r.signed)
@@ -215,6 +214,90 @@ func (card *ContactCard) Read(keyring openpgp.KeyRing) (*openpgp.MessageDetails,
 	}
 
 	return md, nil
+}
+
+func checkContactSignature(keyring openpgp.KeyRing, data []byte, signature string) (*openpgp.Entity, error) {
+	if signature == "" {
+		return nil, errors.New("missing signature")
+	}
+	signer, err := openpgp.CheckArmoredDetachedSignature(keyring, bytes.NewReader(data), strings.NewReader(signature), nil)
+	if err == nil {
+		return signer, nil
+	}
+
+	lf := normalizeToLF(data)
+	crlf := normalizeToCRLF(lf)
+	candidates := make([][]byte, 0, 4)
+	if !bytes.Equal(lf, data) {
+		candidates = append(candidates, lf)
+	}
+	if !bytes.Equal(crlf, data) && !bytes.Equal(crlf, lf) {
+		candidates = append(candidates, crlf)
+	}
+	lfNL := ensureTrailingNewline(lf, []byte{'\n'})
+	if !bytes.Equal(lfNL, lf) {
+		candidates = append(candidates, lfNL)
+	}
+	crlfNL := ensureTrailingNewline(crlf, []byte{'\r', '\n'})
+	if !bytes.Equal(crlfNL, crlf) {
+		candidates = append(candidates, crlfNL)
+	}
+
+	for _, candidate := range candidates {
+		signer, err = openpgp.CheckArmoredDetachedSignature(keyring, bytes.NewReader(candidate), strings.NewReader(signature), nil)
+		if err == nil {
+			return signer, nil
+		}
+	}
+
+	return signer, err
+}
+
+func normalizeToLF(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	out := make([]byte, 0, len(data))
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if b == '\r' {
+			if i+1 < len(data) && data[i+1] == '\n' {
+				i++
+			}
+			out = append(out, '\n')
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func normalizeToCRLF(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	out := make([]byte, 0, len(data)*2)
+	for _, b := range data {
+		if b == '\n' {
+			out = append(out, '\r', '\n')
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func ensureTrailingNewline(data []byte, newline []byte) []byte {
+	if len(data) == 0 || len(newline) == 0 {
+		return data
+	}
+	if bytes.HasSuffix(data, newline) {
+		return data
+	}
+	out := make([]byte, 0, len(data)+len(newline))
+	out = append(out, data...)
+	out = append(out, newline...)
+	return out
 }
 
 type ContactExport struct {

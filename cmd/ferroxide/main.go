@@ -365,10 +365,21 @@ func writeRootPropfindResponseCardDAV(resp http.ResponseWriter, req *http.Reques
 
 func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) {
 	const collectionPath = "/contacts/"
-	const maxResourceSize = 100 * 1024
 
-	_ = backend
 	props := parsePropfindProps(req.Body)
+	needSyncToken := false
+	for _, p := range props {
+		if p.Space == "DAV:" && p.Local == "sync-token" {
+			needSyncToken = true
+			break
+		}
+	}
+	syncToken := ""
+	if needSyncToken && backend != nil {
+		if objects, err := backend.ListAddressObjects(req.Context(), collectionPath, &webdavcarddav.AddressDataRequest{AllProp: true}); err == nil {
+			syncToken = syncTokenFromObjects(objects)
+		}
+	}
 
 	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	resp.WriteHeader(http.StatusMultiStatus)
@@ -429,7 +440,13 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 			b.WriteString(`<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>`)
 			b.WriteString(`</D:supported-report-set>`)
 		case p.Space == "DAV:" && p.Local == "sync-token":
-			b.WriteString(`<D:sync-token>0</D:sync-token>`)
+			token := syncToken
+			if token == "" {
+				token = "0"
+			}
+			b.WriteString(`<D:sync-token>`)
+			_ = xml.EscapeText(&b, []byte(token))
+			b.WriteString(`</D:sync-token>`)
 		case p.Space == "DAV:" && p.Local == "add-member":
 			b.WriteString(`<D:add-member><D:href>`)
 			_ = xml.EscapeText(&b, []byte(collectionPath))
@@ -449,7 +466,7 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 			_ = xml.EscapeText(&b, []byte(carddavVCardVersion))
 			b.WriteString(`"/></C:supported-address-data>`)
 		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "max-resource-size":
-			fmt.Fprintf(&b, "<C:max-resource-size>%d</C:max-resource-size>", maxResourceSize)
+			fmt.Fprintf(&b, "<C:max-resource-size>%d</C:max-resource-size>", carddavMaxResourceSize)
 		case p.Space == "urn:ietf:params:xml:ns:carddav" && p.Local == "max-image-size":
 			b.WriteString(`<C:max-image-size>0</C:max-image-size>`)
 		case p.Space == "urn:mobileme:davservices" && p.Local == "quota-available":
@@ -589,16 +606,7 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 			// so include full address-data in sync-collection responses.
 			report.wantAddressData = true
 
-			h := sha256.New()
-			for _, obj := range objects {
-				_, _ = h.Write([]byte(obj.Path))
-				_, _ = h.Write([]byte(obj.ETag))
-			}
-			if len(objects) == 0 {
-				syncToken = "token-empty"
-			} else {
-				syncToken = fmt.Sprintf("token-%x", h.Sum(nil))
-			}
+			syncToken = syncTokenFromObjects(objects)
 			if mgr, ok := backend.(syncTokenManager); ok {
 				mgr.RememberSyncToken(syncToken)
 			}
@@ -629,6 +637,18 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 
 	b.WriteString(`</D:multistatus>`)
 	_, _ = resp.Write(b.Bytes())
+}
+
+func syncTokenFromObjects(objects []webdavcarddav.AddressObject) string {
+	if len(objects) == 0 {
+		return "token-empty"
+	}
+	h := sha256.New()
+	for _, obj := range objects {
+		_, _ = h.Write([]byte(obj.Path))
+		_, _ = h.Write([]byte(obj.ETag))
+	}
+	return fmt.Sprintf("token-%x", h.Sum(nil))
 }
 
 type carddavReport struct {
