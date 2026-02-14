@@ -3,8 +3,9 @@ package carddav
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -17,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"crypto/sha256"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/acheong08/ferroxide/config"
@@ -907,6 +907,8 @@ type backend struct {
 	labelCacheAt time.Time
 	syncToken   string
 	syncTokenAt time.Time
+	syncSnapshot   map[string]string
+	syncSnapshotAt time.Time
 	uidCache    map[string]string
 	uidCacheAt  time.Time
 	lastServed  map[string]vcard.Card
@@ -964,14 +966,47 @@ func (b *backend) IsSyncTokenValid(token string) bool {
 	return true
 }
 
+// SnapshotForToken returns a snapshot of path->etag for a valid token.
+func (b *backend) SnapshotForToken(token string) (map[string]string, bool) {
+	if token == "" {
+		return nil, false
+	}
+	b.locker.Lock()
+	defer b.locker.Unlock()
+	if b.syncToken == "" || token != b.syncToken {
+		return nil, false
+	}
+	if time.Since(b.syncTokenAt) > syncTokenTTL {
+		return nil, false
+	}
+	if b.syncSnapshot == nil {
+		return nil, false
+	}
+	out := make(map[string]string, len(b.syncSnapshot))
+	for k, v := range b.syncSnapshot {
+		out[k] = v
+	}
+	return out, true
+}
+
 // RememberSyncToken stores the most recent token to validate subsequent syncs.
-func (b *backend) RememberSyncToken(token string) {
+// It also remembers the full set of objects to allow diffing deletions.
+func (b *backend) RememberSyncToken(token string, objects []carddav.AddressObject) {
 	if token == "" {
 		return
+	}
+	snapshot := make(map[string]string, len(objects))
+	for _, obj := range objects {
+		if obj.Path == "" {
+			continue
+		}
+		snapshot[obj.Path] = obj.ETag
 	}
 	b.locker.Lock()
 	b.syncToken = token
 	b.syncTokenAt = time.Now()
+	b.syncSnapshot = snapshot
+	b.syncSnapshotAt = b.syncTokenAt
 	b.locker.Unlock()
 }
 
@@ -1581,6 +1616,8 @@ func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 			b.total = -1
 			b.syncToken = ""
 			b.syncTokenAt = time.Time{}
+			b.syncSnapshot = nil
+			b.syncSnapshotAt = time.Time{}
 		} else if len(event.Contacts) > 0 {
 			// Contact events don't always include full card payloads,
 			// so invalidate the cache and force a full refresh on next sync.
@@ -1588,6 +1625,8 @@ func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 			b.total = -1
 			b.syncToken = ""
 			b.syncTokenAt = time.Time{}
+			b.syncSnapshot = nil
+			b.syncSnapshotAt = time.Time{}
 		}
 		b.locker.Unlock()
 	}

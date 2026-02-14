@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -578,26 +579,58 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 		if report.reportType == "sync-collection" {
 			type syncTokenManager interface {
 				IsSyncTokenValid(token string) bool
-				RememberSyncToken(token string)
+				SnapshotForToken(token string) (map[string]string, bool)
+				RememberSyncToken(token string, objects []webdavcarddav.AddressObject)
 			}
 
+			allObjects := objects
 			validToken := false
+			var snapshot map[string]string
 			if mgr, ok := backend.(syncTokenManager); ok {
 				validToken = mgr.IsSyncTokenValid(report.syncToken)
+				if validToken {
+					snapshot, _ = mgr.SnapshotForToken(report.syncToken)
+				}
 			}
 			// Apple Contacts doesn't always follow up with addressbook-multiget,
 			// so include full address-data in sync-collection responses.
 			report.wantAddressData = true
 
 			syncToken = syncTokenFromObjects(objects)
-			if mgr, ok := backend.(syncTokenManager); ok {
-				mgr.RememberSyncToken(syncToken)
+			var deletions []string
+			if report.syncToken != "" && validToken {
+				if report.syncToken == syncToken {
+					objects = nil
+				} else if snapshot != nil {
+					current := make(map[string]string, len(objects))
+					changed := make([]webdavcarddav.AddressObject, 0, len(objects))
+					for _, obj := range objects {
+						current[obj.Path] = obj.ETag
+						if prev, ok := snapshot[obj.Path]; !ok || prev != obj.ETag {
+							changed = append(changed, obj)
+						}
+					}
+					for path := range snapshot {
+						if _, ok := current[path]; !ok {
+							deletions = append(deletions, path)
+						}
+					}
+					objects = changed
+				}
 			}
-			if report.syncToken != "" && validToken && report.syncToken == syncToken {
-				objects = nil
+			if mgr, ok := backend.(syncTokenManager); ok {
+				mgr.RememberSyncToken(syncToken, allObjects)
 			}
 			if debug {
 				log.Printf("carddav/report: sync-collection tokenValid=%t forceData=%t", validToken, report.wantAddressData)
+			}
+
+			if len(deletions) > 0 {
+				for _, path := range deletions {
+					b.WriteString(`<D:response><D:href>`)
+					_ = xml.EscapeText(&b, []byte(path))
+					b.WriteString(`</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>`)
+				}
 			}
 		}
 		if debug {
@@ -626,8 +659,16 @@ func syncTokenFromObjects(objects []webdavcarddav.AddressObject) string {
 	if len(objects) == 0 {
 		return "token-empty"
 	}
+	ordered := make([]webdavcarddav.AddressObject, len(objects))
+	copy(ordered, objects)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Path == ordered[j].Path {
+			return ordered[i].ETag < ordered[j].ETag
+		}
+		return ordered[i].Path < ordered[j].Path
+	})
 	h := sha256.New()
-	for _, obj := range objects {
+	for _, obj := range ordered {
 		_, _ = h.Write([]byte(obj.Path))
 		_, _ = h.Write([]byte(obj.ETag))
 	}
