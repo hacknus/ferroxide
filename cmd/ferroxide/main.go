@@ -607,8 +607,11 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 					snapshot, _ = mgr.SnapshotForToken(report.syncToken)
 				}
 			}
-			// Only include address-data if the client asked for it.
-			// Apple generally follows up with addressbook-multiget.
+			// For initial sync (no token), include address-data so clients that don't
+			// follow up with multiget still download full cards.
+			if report.syncToken == "" {
+				report.wantAddressData = true
+			}
 
 			syncToken = ferrocarddav.SyncTokenFromObjects(objects)
 			var deletions []string
