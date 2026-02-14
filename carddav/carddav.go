@@ -1215,6 +1215,13 @@ func (b *backend) resolveContactID(ctx context.Context, path string, card vcard.
 	return id, nil
 }
 
+func isContactNotFound(err error) bool {
+	if apiErr, ok := err.(*protonmail.APIError); ok {
+		return apiErr.Code == 13051 || apiErr.Code == 2501 || apiErr.Code == 2061
+	}
+	return false
+}
+
 func (b *backend) CurrentUserPrincipal(ctx context.Context) (string, error) {
 	return "/contacts/", nil
 }
@@ -1372,6 +1379,11 @@ func (b *backend) QueryAddressObjects(ctx context.Context, path string, query *c
 }
 
 func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.Card, opts *carddav.PutAddressObjectOptions) (ao *carddav.AddressObject, err error) {
+	pathID, err := parseAddressObjectPath(path)
+	if err != nil {
+		return nil, err
+	}
+
 	id, err := b.resolveContactID(ctx, path, card)
 	if err != nil {
 		return nil, err
@@ -1391,7 +1403,10 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 			contact = existing
 			b.putCache(existing)
 			exists = true
-		} else if apiErr, ok := getErr.(*protonmail.APIError); ok && (apiErr.Code == 13051 || apiErr.Code == 2501 || apiErr.Code == 2061) {
+		} else if isContactNotFound(getErr) {
+			if id == pathID {
+				return nil, webdav.NewHTTPError(http.StatusNotFound, errors.New("contact not found"))
+			}
 			exists = false
 		} else if getErr != nil {
 			log.Printf("carddav: GET contact failed for %s (%s): %v", path, id, getErr)
@@ -1614,19 +1629,11 @@ func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 		if event.Refresh&protonmail.EventRefreshContacts != 0 {
 			b.cache = make(map[string]*protonmail.Contact)
 			b.total = -1
-			b.syncToken = ""
-			b.syncTokenAt = time.Time{}
-			b.syncSnapshot = nil
-			b.syncSnapshotAt = time.Time{}
 		} else if len(event.Contacts) > 0 {
 			// Contact events don't always include full card payloads,
 			// so invalidate the cache and force a full refresh on next sync.
 			b.cache = make(map[string]*protonmail.Contact)
 			b.total = -1
-			b.syncToken = ""
-			b.syncTokenAt = time.Time{}
-			b.syncSnapshot = nil
-			b.syncSnapshotAt = time.Time{}
 		}
 		b.locker.Unlock()
 	}
