@@ -3,12 +3,14 @@ package carddav
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/acheong08/ferroxide/config"
 	"github.com/acheong08/ferroxide/protonmail"
 	"github.com/emersion/go-vcard"
 	"github.com/emersion/go-webdav"
@@ -38,7 +41,10 @@ var addressBook = &carddav.AddressBook{
 	MaxResourceSize: 100 * 1024,
 }
 
-const lastServedTTL = 1 * time.Hour
+const (
+	lastServedTTL           = 1 * time.Hour
+	lastServedFlushInterval = 5 * time.Second
+)
 
 func cloneCard(card vcard.Card) vcard.Card {
 	out := make(vcard.Card, len(card))
@@ -670,7 +676,14 @@ func (b *backend) rememberLastServed(id string, card vcard.Card) {
 	}
 	b.lastServed[id] = cloneCard(card)
 	b.lastServedAt[id] = time.Now()
+	shouldFlush := time.Since(b.lastServedFlushAt) >= lastServedFlushInterval
+	if shouldFlush {
+		b.lastServedFlushAt = time.Now()
+	}
 	b.locker.Unlock()
+	if shouldFlush {
+		b.flushLastServed()
+	}
 }
 
 func (b *backend) lastServedSnapshot(id string) (vcard.Card, bool) {
@@ -691,6 +704,121 @@ func (b *backend) lastServedSnapshot(id string) (vcard.Card, bool) {
 		return nil, false
 	}
 	return cloneCard(card), true
+}
+
+type lastServedEntry struct {
+	Card string `json:"card"`
+	At   int64  `json:"at"`
+}
+
+type lastServedCache struct {
+	Entries map[string]lastServedEntry `json:"entries"`
+}
+
+func lastServedCachePath() (string, error) {
+	return config.Path("carddav-last-served.json")
+}
+
+func serializeCard(card vcard.Card) (string, error) {
+	var b bytes.Buffer
+	if err := vcard.NewEncoder(&b).Encode(card); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func parseCard(data string) (vcard.Card, error) {
+	return vcard.NewDecoder(strings.NewReader(data)).Decode()
+}
+
+func (b *backend) loadLastServed() {
+	path, err := lastServedCachePath()
+	if err != nil {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	var cache lastServedCache
+	if err := json.NewDecoder(f).Decode(&cache); err != nil {
+		return
+	}
+
+	now := time.Now()
+	if cache.Entries == nil {
+		return
+	}
+
+	b.locker.Lock()
+	if b.lastServed == nil {
+		b.lastServed = make(map[string]vcard.Card)
+	}
+	if b.lastServedAt == nil {
+		b.lastServedAt = make(map[string]time.Time)
+	}
+	for id, entry := range cache.Entries {
+		if entry.At == 0 {
+			continue
+		}
+		at := time.Unix(entry.At, 0)
+		if now.Sub(at) > lastServedTTL {
+			continue
+		}
+		card, err := parseCard(entry.Card)
+		if err != nil {
+			continue
+		}
+		b.lastServed[id] = card
+		b.lastServedAt[id] = at
+	}
+	b.locker.Unlock()
+}
+
+func (b *backend) flushLastServed() {
+	path, err := lastServedCachePath()
+	if err != nil {
+		return
+	}
+	cache := lastServedCache{Entries: make(map[string]lastServedEntry)}
+	now := time.Now()
+
+	b.locker.Lock()
+	for id, card := range b.lastServed {
+		at, ok := b.lastServedAt[id]
+		if !ok || now.Sub(at) > lastServedTTL {
+			continue
+		}
+		encoded, err := serializeCard(card)
+		if err != nil {
+			continue
+		}
+		cache.Entries[id] = lastServedEntry{
+			Card: encoded,
+			At:   at.Unix(),
+		}
+	}
+	b.locker.Unlock()
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&cache); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Contact, req *carddav.AddressDataRequest) (*carddav.AddressObject, error) {
@@ -730,6 +858,7 @@ type backend struct {
 	uidCacheAt  time.Time
 	lastServed  map[string]vcard.Card
 	lastServedAt map[string]time.Time
+	lastServedFlushAt time.Time
 }
 
 const labelCacheTTL = 5 * time.Minute
@@ -1154,6 +1283,8 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 			if currentCard, buildErr := b.buildCardFromContact(ctx, contact); buildErr == nil {
 				card = mergeCards(base, card, currentCard)
 			}
+		} else if b.c != nil && b.c.Debug {
+			log.Printf("carddav: merge skipped for %s (no last-served snapshot)", contact.ID)
 		}
 		contactImport, err = buildContactImport(card, b.privateKeys, b.encryptKeys, true, b.vcardVer)
 		if err != nil {
@@ -1501,6 +1632,7 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, events <-c
 		encryptKeysAddr: encryptKeysAddr,
 		vcardVer:        vcardVersion,
 	}
+	b.loadLastServed()
 
 	if events != nil {
 		go b.receiveEvents(events)
