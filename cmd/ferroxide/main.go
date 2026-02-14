@@ -849,7 +849,7 @@ func handleCarddavPost(resp http.ResponseWriter, req *http.Request, backend webd
 
 	id := uuid.New().String()
 	path := "/contacts/" + id + ".vcf"
-	ao, err := backend.PutAddressObject(req.Context(), path, card, nil)
+	ao, err := backend.PutAddressObject(ferrocarddav.WithCreateContext(req.Context()), path, card, nil)
 	if err != nil {
 		if debug {
 			log.Printf("carddav/post: failed to create contact: %v", err)

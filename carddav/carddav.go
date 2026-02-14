@@ -27,6 +27,18 @@ import (
 	"github.com/emersion/go-webdav/carddav"
 )
 
+type createContextKey struct{}
+
+// WithCreateContext marks a request as a create, allowing PUT logic to fall back to create.
+func WithCreateContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, createContextKey{}, true)
+}
+
+func isCreateContext(ctx context.Context) bool {
+	v, ok := ctx.Value(createContextKey{}).(bool)
+	return ok && v
+}
+
 // TODO: use a HTTP error
 var errNotFound = errors.New("carddav: not found")
 
@@ -1456,7 +1468,7 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 			b.putCache(existing)
 			exists = true
 		} else if isContactNotFound(getErr) {
-			if id == pathID {
+			if id == pathID && !isCreateContext(ctx) {
 				return nil, webdav.NewHTTPError(http.StatusNotFound, errors.New("contact not found"))
 			}
 			exists = false
