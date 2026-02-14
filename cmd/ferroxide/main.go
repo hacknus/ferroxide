@@ -829,6 +829,25 @@ func handleCarddavPost(resp http.ResponseWriter, req *http.Request, backend webd
 	return http.StatusCreated
 }
 
+func handleCarddavDelete(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) int {
+	path := req.URL.Path
+	if !strings.HasPrefix(path, "/contacts/") || !strings.HasSuffix(path, ".vcf") {
+		resp.WriteHeader(http.StatusNotFound)
+		return http.StatusNotFound
+	}
+
+	if err := backend.DeleteAddressObject(req.Context(), path); err != nil {
+		if debug {
+			log.Printf("carddav/delete: failed to delete %s: %v", path, err)
+		}
+		resp.WriteHeader(http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+
+	resp.WriteHeader(http.StatusNoContent)
+	return http.StatusNoContent
+}
+
 func listenAndServeCalDAV(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
@@ -993,6 +1012,17 @@ func listenAndServeCardDAV(addr string, debug bool, authManager *auth.Manager, e
 				handler, ok := h.(*webdavcarddav.Handler)
 				if ok {
 					status := handleCarddavPost(resp, req, handler.Backend)
+					if debug {
+						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, status)
+					}
+					return
+				}
+			}
+
+			if req.Method == "DELETE" && strings.HasPrefix(req.URL.Path, "/contacts/") {
+				handler, ok := h.(*webdavcarddav.Handler)
+				if ok {
+					status := handleCarddavDelete(resp, req, handler.Backend)
 					if debug {
 						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, status)
 					}
