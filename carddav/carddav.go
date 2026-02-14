@@ -1074,6 +1074,39 @@ func (b *backend) rebuildUIDCache(ctx context.Context) error {
 	return nil
 }
 
+func (b *backend) hydrateContactCards(contact *protonmail.Contact) error {
+	if contact == nil || strings.TrimSpace(contact.ID) == "" {
+		return errors.New("carddav: missing contact id for card hydration")
+	}
+	if len(contact.Cards) > 0 {
+		return nil
+	}
+
+	page := 0
+	for {
+		_, exports, err := b.c.ListContactsExport(page, 0)
+		if err != nil {
+			return err
+		}
+		if len(exports) == 0 {
+			break
+		}
+		for _, contactExport := range exports {
+			if contactExport == nil || contactExport.ID != contact.ID {
+				continue
+			}
+			contact.Cards = contactExport.Cards
+			if len(contact.Cards) == 0 {
+				return errors.New("carddav: contact export returned no cards")
+			}
+			return nil
+		}
+		page++
+	}
+
+	return errNotFound
+}
+
 func (b *backend) resolveContactID(ctx context.Context, path string, card vcard.Card) (string, error) {
 	id, err := parseAddressObjectPath(path)
 	if err != nil {
@@ -1280,8 +1313,21 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 
 	if exists {
 		if base, ok := b.lastServedSnapshot(contact.ID); ok {
-			if currentCard, buildErr := b.buildCardFromContact(ctx, contact); buildErr == nil {
-				card = mergeCards(base, card, currentCard)
+			if contact != nil && len(contact.Cards) == 0 {
+				if err := b.hydrateContactCards(contact); err != nil {
+					if b.c != nil && b.c.Debug {
+						log.Printf("carddav: merge skipped for %s (hydrate cards failed: %v)", contact.ID, err)
+					}
+				} else {
+					b.putCache(contact)
+				}
+			}
+			if contact != nil && len(contact.Cards) > 0 {
+				if currentCard, buildErr := b.buildCardFromContact(ctx, contact); buildErr == nil {
+					card = mergeCards(base, card, currentCard)
+				} else if b.c != nil && b.c.Debug {
+					log.Printf("carddav: merge skipped for %s (current card build failed: %v)", contact.ID, buildErr)
+				}
 			}
 		} else if b.c != nil && b.c.Debug {
 			log.Printf("carddav: merge skipped for %s (no last-served snapshot)", contact.ID)
