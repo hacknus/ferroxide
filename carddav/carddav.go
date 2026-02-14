@@ -1349,10 +1349,14 @@ func (b *backend) GetAddressObject(ctx context.Context, path string, req *cardda
 func (b *backend) ListAddressObjects(ctx context.Context, path string, req *carddav.AddressDataRequest) ([]carddav.AddressObject, error) {
 	if b.cacheComplete() {
 		b.locker.Lock()
-		defer b.locker.Unlock()
-
-		aos := make([]carddav.AddressObject, 0, len(b.cache))
+		contacts := make([]*protonmail.Contact, 0, len(b.cache))
 		for _, contact := range b.cache {
+			contacts = append(contacts, contact)
+		}
+		b.locker.Unlock()
+
+		aos := make([]carddav.AddressObject, 0, len(contacts))
+		for _, contact := range contacts {
 			ao, err := b.toAddressObject(ctx, contact, req)
 			if err != nil {
 				return nil, err
