@@ -483,6 +483,10 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 		log.Printf("carddav/report: path=%s type=%s hrefs=%d wantEtag=%t wantData=%t syncToken=%q body=%q", req.URL.Path, report.reportType, len(report.hrefs), report.wantETag, report.wantAddressData, report.syncToken, string(body))
 	}
 
+	if report.reportType == "sync-collection" && (report.syncToken == "0" || report.syncToken == "token-empty") {
+		report.syncToken = ""
+	}
+
 	if report.reportType == "sync-collection" && report.syncToken != "" {
 		type syncTokenValidator interface {
 			IsSyncTokenValid(token string) bool
