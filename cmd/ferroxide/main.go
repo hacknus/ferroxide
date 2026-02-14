@@ -607,9 +607,8 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 					snapshot, _ = mgr.SnapshotForToken(report.syncToken)
 				}
 			}
-			// Apple Contacts doesn't always follow up with addressbook-multiget,
-			// so include full address-data in sync-collection responses.
-			report.wantAddressData = true
+			// Only include address-data if the client asked for it.
+			// Apple generally follows up with addressbook-multiget.
 
 			syncToken = ferrocarddav.SyncTokenFromObjects(objects)
 			var deletions []string
