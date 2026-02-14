@@ -428,7 +428,17 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 			b.WriteString(`<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>`)
 			b.WriteString(`</D:supported-report-set>`)
 		case p.Space == "DAV:" && p.Local == "sync-token":
-			b.WriteString(`<D:sync-token>0</D:sync-token>`)
+			token := "0"
+			if backend != nil {
+				if provider, ok := backend.(interface{ CurrentSyncToken() string }); ok {
+					if t := strings.TrimSpace(provider.CurrentSyncToken()); t != "" {
+						token = t
+					}
+				}
+			}
+			b.WriteString(`<D:sync-token>`)
+			_ = xml.EscapeText(&b, []byte(token))
+			b.WriteString(`</D:sync-token>`)
 		case p.Space == "DAV:" && p.Local == "add-member":
 			b.WriteString(`<D:add-member><D:href>`)
 			_ = xml.EscapeText(&b, []byte(collectionPath))

@@ -1044,6 +1044,16 @@ func (b *backend) SnapshotForToken(token string) (map[string]string, bool) {
 	return out, true
 }
 
+// CurrentSyncToken returns the last issued sync token, or "0" if none issued yet.
+func (b *backend) CurrentSyncToken() string {
+	b.locker.Lock()
+	defer b.locker.Unlock()
+	if !b.syncTokenIssued || b.syncToken == "" || time.Since(b.syncTokenAt) > syncTokenTTL {
+		return "0"
+	}
+	return b.syncToken
+}
+
 func (b *backend) rememberSyncSnapshot(token string, objects []carddav.AddressObject, issued bool) {
 	if token == "" {
 		return
