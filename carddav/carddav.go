@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,8 @@ var addressBook = &carddav.AddressBook{
 	MaxResourceSize: 100 * 1024,
 }
 
+const lastServedTTL = 1 * time.Hour
+
 func cloneCard(card vcard.Card) vcard.Card {
 	out := make(vcard.Card, len(card))
 	for k, fields := range card {
@@ -45,6 +48,114 @@ func cloneCard(card vcard.Card) vcard.Card {
 		out[k] = copied
 	}
 	return out
+}
+
+func cloneFields(fields []*vcard.Field) []*vcard.Field {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]*vcard.Field, len(fields))
+	for i, f := range fields {
+		if f == nil {
+			continue
+		}
+		nf := *f
+		if f.Params != nil {
+			nf.Params = make(vcard.Params, len(f.Params))
+			for k, v := range f.Params {
+				vals := make([]string, len(v))
+				copy(vals, v)
+				nf.Params[k] = vals
+			}
+		}
+		out[i] = &nf
+	}
+	return out
+}
+
+func fieldSignature(f *vcard.Field) string {
+	if f == nil {
+		return ""
+	}
+	var params []string
+	for k, vals := range f.Params {
+		key := strings.ToUpper(k)
+		if len(vals) == 0 {
+			params = append(params, key+"=")
+			continue
+		}
+		valsCopy := make([]string, len(vals))
+		copy(valsCopy, vals)
+		sort.Strings(valsCopy)
+		params = append(params, key+"="+strings.Join(valsCopy, ","))
+	}
+	sort.Strings(params)
+	return strings.Join([]string{f.Group, strings.Join(params, ";"), f.Value}, "|")
+}
+
+func fieldsEqual(a, b []*vcard.Field) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	as := make([]string, 0, len(a))
+	for _, f := range a {
+		as = append(as, fieldSignature(f))
+	}
+	bs := make([]string, 0, len(b))
+	for _, f := range b {
+		bs = append(bs, fieldSignature(f))
+	}
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeCardKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func fieldsByName(card vcard.Card) map[string][]*vcard.Field {
+	out := make(map[string][]*vcard.Field, len(card))
+	for k, fields := range card {
+		key := normalizeCardKey(k)
+		if key == "" {
+			continue
+		}
+		out[key] = append(out[key], fields...)
+	}
+	return out
+}
+
+func mergeCards(base, incoming, current vcard.Card) vcard.Card {
+	merged := cloneCard(current)
+	baseMap := fieldsByName(base)
+	inMap := fieldsByName(incoming)
+	names := make(map[string]struct{}, len(baseMap)+len(inMap))
+	for k := range baseMap {
+		names[k] = struct{}{}
+	}
+	for k := range inMap {
+		names[k] = struct{}{}
+	}
+
+	for name := range names {
+		if fieldsEqual(baseMap[name], inMap[name]) {
+			continue
+		}
+		deleteFieldsByName(merged, name)
+		if fields := inMap[name]; len(fields) > 0 {
+			merged[strings.ToUpper(name)] = cloneFields(fields)
+		}
+	}
+	return merged
 }
 
 func mergeUniqueStrings(dst []string, add []string) []string {
@@ -484,9 +595,7 @@ func formatAddressObjectPath(id string) string {
 	return "/contacts/" + id + ".vcf"
 }
 
-func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Contact, req *carddav.AddressDataRequest) (*carddav.AddressObject, error) {
-	// TODO: handle req
-
+func (b *backend) buildCardFromContact(ctx context.Context, contact *protonmail.Contact) (vcard.Card, error) {
 	card := make(vcard.Card)
 	for _, c := range contact.Cards {
 		keyring := b.verifyKeys
@@ -507,7 +616,15 @@ func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Conta
 		// EOF
 		io.Copy(io.Discard, md.UnverifiedBody)
 		if err := md.SignatureError; err != nil {
-			log.Printf("carddav: warning: signature verification failed for contact %s: %v", contact.ID, err)
+			name := strings.TrimSpace(contact.Name)
+			if name == "" {
+				name = extractDisplayName(decoded)
+			}
+			if name != "" {
+				log.Printf("carddav: warning: signature verification failed for contact %s (name=%q): %v", contact.ID, name, err)
+			} else {
+				log.Printf("carddav: warning: signature verification failed for contact %s: %v", contact.ID, err)
+			}
 		}
 
 		for k, fields := range decoded {
@@ -537,6 +654,54 @@ func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Conta
 		mergeCategories(card, extractPMGroups(card))
 	}
 
+	return card, nil
+}
+
+func (b *backend) rememberLastServed(id string, card vcard.Card) {
+	if id == "" {
+		return
+	}
+	b.locker.Lock()
+	if b.lastServed == nil {
+		b.lastServed = make(map[string]vcard.Card)
+	}
+	if b.lastServedAt == nil {
+		b.lastServedAt = make(map[string]time.Time)
+	}
+	b.lastServed[id] = cloneCard(card)
+	b.lastServedAt[id] = time.Now()
+	b.locker.Unlock()
+}
+
+func (b *backend) lastServedSnapshot(id string) (vcard.Card, bool) {
+	if id == "" {
+		return nil, false
+	}
+	b.locker.Lock()
+	defer b.locker.Unlock()
+	if b.lastServed == nil || b.lastServedAt == nil {
+		return nil, false
+	}
+	at, ok := b.lastServedAt[id]
+	if !ok || time.Since(at) > lastServedTTL {
+		return nil, false
+	}
+	card, ok := b.lastServed[id]
+	if !ok {
+		return nil, false
+	}
+	return cloneCard(card), true
+}
+
+func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Contact, req *carddav.AddressDataRequest) (*carddav.AddressObject, error) {
+	// TODO: handle req
+
+	card, err := b.buildCardFromContact(ctx, contact)
+	if err != nil {
+		return nil, err
+	}
+	b.rememberLastServed(contact.ID, card)
+
 	return &carddav.AddressObject{
 		Path:    formatAddressObjectPath(contact.ID),
 		ModTime: contact.ModifyTime.Time(),
@@ -563,6 +728,8 @@ type backend struct {
 	syncTokenAt time.Time
 	uidCache    map[string]string
 	uidCacheAt  time.Time
+	lastServed  map[string]vcard.Card
+	lastServedAt map[string]time.Time
 }
 
 const labelCacheTTL = 5 * time.Minute
@@ -644,6 +811,52 @@ func extractUID(card vcard.Card) string {
 	return ""
 }
 
+func extractDisplayName(card vcard.Card) string {
+	for k, fields := range card {
+		if !strings.EqualFold(k, vcard.FieldFormattedName) {
+			continue
+		}
+		for _, f := range fields {
+			if f == nil {
+				continue
+			}
+			name := strings.TrimSpace(f.Value)
+			if name != "" {
+				return name
+			}
+		}
+	}
+	for k, fields := range card {
+		if !strings.EqualFold(k, vcard.FieldName) {
+			continue
+		}
+		for _, f := range fields {
+			if f == nil {
+				continue
+			}
+			name := strings.TrimSpace(f.Value)
+			if name != "" {
+				return name
+			}
+		}
+	}
+	for k, fields := range card {
+		if !strings.EqualFold(k, vcard.FieldEmail) {
+			continue
+		}
+		for _, f := range fields {
+			if f == nil {
+				continue
+			}
+			name := strings.TrimSpace(f.Value)
+			if name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
 func (b *backend) rememberUID(uid, id string) {
 	uid = strings.TrimSpace(uid)
 	id = strings.TrimSpace(id)
@@ -704,10 +917,15 @@ func (b *backend) rebuildUIDCache(ctx context.Context) error {
 				if err != nil {
 					continue
 				}
-				io.Copy(io.Discard, md.UnverifiedBody)
-				if err := md.SignatureError; err != nil {
-					log.Printf("carddav: warning: signature verification failed for export %s: %v", contactExport.ID, err)
-				}
+					io.Copy(io.Discard, md.UnverifiedBody)
+					if err := md.SignatureError; err != nil {
+						name := extractDisplayName(decoded)
+						if name != "" {
+							log.Printf("carddav: warning: signature verification failed for export %s (name=%q): %v", contactExport.ID, name, err)
+						} else {
+							log.Printf("carddav: warning: signature verification failed for export %s: %v", contactExport.ID, err)
+						}
+					}
 				for k, fields := range decoded {
 					for _, f := range fields {
 						card.Add(k, f)
@@ -932,6 +1150,16 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 	}
 
 	if exists {
+		if base, ok := b.lastServedSnapshot(contact.ID); ok {
+			if currentCard, buildErr := b.buildCardFromContact(ctx, contact); buildErr == nil {
+				card = mergeCards(base, card, currentCard)
+			}
+		}
+		contactImport, err = buildContactImport(card, b.privateKeys, b.encryptKeys, true, b.vcardVer)
+		if err != nil {
+			return nil, err
+		}
+
 		contact, err = b.c.UpdateContact(id, contactImport)
 		if apiErr, ok := err.(*protonmail.APIError); ok && apiErr.Code == 2060 {
 			if len(b.encryptKeysAddr) > 0 && !sameKeySet(b.encryptKeysAddr, b.encryptKeys) {
@@ -1087,6 +1315,7 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 
 	// TODO: increment b.total if necessary
 	b.putCache(contact)
+	b.rememberLastServed(contact.ID, card)
 
 	return &carddav.AddressObject{
 		Path:    formatAddressObjectPath(contact.ID),
