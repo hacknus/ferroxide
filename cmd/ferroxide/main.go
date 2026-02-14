@@ -502,11 +502,10 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 			IsSyncTokenValid(token string) bool
 		}
 		if mgr, ok := backend.(syncTokenValidator); ok && !mgr.IsSyncTokenValid(report.syncToken) {
-			resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
-			resp.WriteHeader(http.StatusForbidden)
-			_, _ = resp.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
-				`<D:error xmlns:D="DAV:"><D:valid-sync-token/></D:error>`))
-			return http.StatusForbidden
+			if debug {
+				log.Printf("carddav/report: invalid sync token %q, forcing full sync", report.syncToken)
+			}
+			report.syncToken = ""
 		}
 	}
 
