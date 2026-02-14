@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"crypto/sha256"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/acheong08/ferroxide/config"
@@ -97,6 +99,58 @@ func fieldSignature(f *vcard.Field) string {
 	}
 	sort.Strings(params)
 	return strings.Join([]string{f.Group, strings.Join(params, ";"), f.Value}, "|")
+}
+
+func addStringHash(h hash.Hash, s string) {
+	_, _ = h.Write([]byte(s))
+	_, _ = h.Write([]byte{0})
+}
+
+func contactETag(contact *protonmail.Contact, card vcard.Card) string {
+	if contact != nil && len(contact.Cards) > 0 {
+		type cardKey struct {
+			t   int
+			d   string
+			sig string
+		}
+		keys := make([]cardKey, 0, len(contact.Cards))
+		for _, c := range contact.Cards {
+			if c == nil {
+				continue
+			}
+			keys = append(keys, cardKey{t: int(c.Type), d: c.Data, sig: c.Signature})
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].t != keys[j].t {
+				return keys[i].t < keys[j].t
+			}
+			if keys[i].d != keys[j].d {
+				return keys[i].d < keys[j].d
+			}
+			return keys[i].sig < keys[j].sig
+		})
+
+		h := sha256.New()
+		for _, k := range keys {
+			addStringHash(h, fmt.Sprintf("%d", k.t))
+			addStringHash(h, k.d)
+			addStringHash(h, k.sig)
+		}
+		return fmt.Sprintf("%x", h.Sum(nil))
+	}
+
+	if card != nil {
+		if data, err := serializeCard(card); err == nil && data != "" {
+			h := sha256.New()
+			addStringHash(h, data)
+			return fmt.Sprintf("%x", h.Sum(nil))
+		}
+	}
+
+	if contact != nil {
+		return fmt.Sprintf("%x%x", contact.ModifyTime, contact.Size)
+	}
+	return ""
 }
 
 func fieldsEqual(a, b []*vcard.Field) bool {
@@ -833,8 +887,7 @@ func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Conta
 	return &carddav.AddressObject{
 		Path:    formatAddressObjectPath(contact.ID),
 		ModTime: contact.ModifyTime.Time(),
-		// TODO: stronger ETag
-		ETag: fmt.Sprintf("%x%x", contact.ModifyTime, contact.Size),
+		ETag:    contactETag(contact, card),
 	Card: card,
 	}, nil
 }
@@ -1497,8 +1550,7 @@ func (b *backend) PutAddressObject(ctx context.Context, path string, card vcard.
 	return &carddav.AddressObject{
 		Path:    formatAddressObjectPath(contact.ID),
 		ModTime: contact.ModifyTime.Time(),
-		// TODO: stronger ETag
-		ETag: fmt.Sprintf("%x%x", contact.ModifyTime, contact.Size),
+		ETag:    contactETag(contact, card),
 		Card: card,
 	}, nil
 }
