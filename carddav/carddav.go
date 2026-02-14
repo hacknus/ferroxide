@@ -1481,23 +1481,15 @@ func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 		if event.Refresh&protonmail.EventRefreshContacts != 0 {
 			b.cache = make(map[string]*protonmail.Contact)
 			b.total = -1
+			b.syncToken = ""
+			b.syncTokenAt = time.Time{}
 		} else if len(event.Contacts) > 0 {
-			for _, eventContact := range event.Contacts {
-				switch eventContact.Action {
-				case protonmail.EventCreate:
-					if b.total >= 0 {
-						b.total++
-					}
-					fallthrough
-				case protonmail.EventUpdate:
-					b.cache[eventContact.ID] = eventContact.Contact
-				case protonmail.EventDelete:
-					delete(b.cache, eventContact.ID)
-					if b.total >= 0 {
-						b.total--
-					}
-				}
-			}
+			// Contact events don't always include full card payloads,
+			// so invalidate the cache and force a full refresh on next sync.
+			b.cache = make(map[string]*protonmail.Contact)
+			b.total = -1
+			b.syncToken = ""
+			b.syncTokenAt = time.Time{}
 		}
 		b.locker.Unlock()
 	}
