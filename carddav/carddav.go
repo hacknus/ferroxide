@@ -772,7 +772,8 @@ func (b *backend) primeSyncSnapshot(ctx context.Context) {
 	if token == "" {
 		return
 	}
-	b.RememberSyncToken(token, objects)
+	// Do not treat the primed token as issued; force clients to resync after restart.
+	b.rememberSyncSnapshot(token, objects, false)
 }
 
 func (b *backend) lastServedSnapshot(id string) (vcard.Card, bool) {
@@ -944,6 +945,7 @@ type backend struct {
 	syncTokenAt time.Time
 	syncSnapshot   map[string]string
 	syncSnapshotAt time.Time
+	syncTokenIssued bool
 	uidCache    map[string]string
 	uidCacheAt  time.Time
 	lastServed  map[string]vcard.Card
@@ -992,6 +994,9 @@ func (b *backend) IsSyncTokenValid(token string) bool {
 	}
 	b.locker.Lock()
 	defer b.locker.Unlock()
+	if !b.syncTokenIssued {
+		return false
+	}
 	if b.syncToken == "" || token != b.syncToken {
 		return false
 	}
@@ -1008,6 +1013,9 @@ func (b *backend) SnapshotForToken(token string) (map[string]string, bool) {
 	}
 	b.locker.Lock()
 	defer b.locker.Unlock()
+	if !b.syncTokenIssued {
+		return nil, false
+	}
 	if b.syncToken == "" || token != b.syncToken {
 		return nil, false
 	}
@@ -1024,9 +1032,7 @@ func (b *backend) SnapshotForToken(token string) (map[string]string, bool) {
 	return out, true
 }
 
-// RememberSyncToken stores the most recent token to validate subsequent syncs.
-// It also remembers the full set of objects to allow diffing deletions.
-func (b *backend) RememberSyncToken(token string, objects []carddav.AddressObject) {
+func (b *backend) rememberSyncSnapshot(token string, objects []carddav.AddressObject, issued bool) {
 	if token == "" {
 		return
 	}
@@ -1042,7 +1048,14 @@ func (b *backend) RememberSyncToken(token string, objects []carddav.AddressObjec
 	b.syncTokenAt = time.Now()
 	b.syncSnapshot = snapshot
 	b.syncSnapshotAt = b.syncTokenAt
+	b.syncTokenIssued = issued
 	b.locker.Unlock()
+}
+
+// RememberSyncToken stores the most recent token to validate subsequent syncs.
+// It also remembers the full set of objects to allow diffing deletions.
+func (b *backend) RememberSyncToken(token string, objects []carddav.AddressObject) {
+	b.rememberSyncSnapshot(token, objects, true)
 }
 
 func extractUID(card vcard.Card) string {
