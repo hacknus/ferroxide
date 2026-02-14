@@ -46,6 +46,7 @@ var addressBook = &carddav.AddressBook{
 const (
 	lastServedTTL           = 1 * time.Hour
 	lastServedFlushInterval = 5 * time.Second
+	syncSnapshotFlushInterval = 5 * time.Second
 )
 
 func cloneCard(card vcard.Card) vcard.Card {
@@ -773,6 +774,16 @@ func lastServedCachePath() (string, error) {
 	return config.Path("carddav-last-served.json")
 }
 
+type syncSnapshotCache struct {
+	Token   string            `json:"token"`
+	At      int64             `json:"at"`
+	Entries map[string]string `json:"entries"`
+}
+
+func syncSnapshotCachePath() (string, error) {
+	return config.Path("carddav-sync-snapshot.json")
+}
+
 func serializeCard(card vcard.Card) (string, error) {
 	var b bytes.Buffer
 	if err := vcard.NewEncoder(&b).Encode(card); err != nil {
@@ -875,6 +886,80 @@ func (b *backend) flushLastServed() {
 	_ = os.Rename(tmp, path)
 }
 
+func (b *backend) loadSyncSnapshot() {
+	path, err := syncSnapshotCachePath()
+	if err != nil {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	var cache syncSnapshotCache
+	if err := json.NewDecoder(f).Decode(&cache); err != nil {
+		return
+	}
+	if cache.Token == "" || cache.At == 0 || cache.Entries == nil {
+		return
+	}
+
+	at := time.Unix(cache.At, 0)
+	if time.Since(at) > syncTokenTTL {
+		return
+	}
+
+	b.locker.Lock()
+	b.syncToken = cache.Token
+	b.syncTokenAt = at
+	b.syncSnapshot = cache.Entries
+	b.syncSnapshotAt = at
+	b.locker.Unlock()
+}
+
+func (b *backend) flushSyncSnapshot() {
+	path, err := syncSnapshotCachePath()
+	if err != nil {
+		return
+	}
+	cache := syncSnapshotCache{}
+
+	b.locker.Lock()
+	if b.syncToken == "" || b.syncSnapshot == nil || time.Since(b.syncTokenAt) > syncTokenTTL {
+		b.locker.Unlock()
+		return
+	}
+	cache.Token = b.syncToken
+	cache.At = b.syncTokenAt.Unix()
+	cache.Entries = make(map[string]string, len(b.syncSnapshot))
+	for path, etag := range b.syncSnapshot {
+		if path == "" || etag == "" {
+			continue
+		}
+		cache.Entries[path] = etag
+	}
+	b.locker.Unlock()
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&cache); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
 func (b *backend) toAddressObject(ctx context.Context, contact *protonmail.Contact, req *carddav.AddressDataRequest) (*carddav.AddressObject, error) {
 	// TODO: handle req
 
@@ -909,6 +994,7 @@ type backend struct {
 	syncTokenAt time.Time
 	syncSnapshot   map[string]string
 	syncSnapshotAt time.Time
+	syncSnapshotFlushAt time.Time
 	uidCache    map[string]string
 	uidCacheAt  time.Time
 	lastServed  map[string]vcard.Card
@@ -1002,12 +1088,20 @@ func (b *backend) RememberSyncToken(token string, objects []carddav.AddressObjec
 		}
 		snapshot[obj.Path] = obj.ETag
 	}
+	shouldFlush := false
 	b.locker.Lock()
 	b.syncToken = token
 	b.syncTokenAt = time.Now()
 	b.syncSnapshot = snapshot
 	b.syncSnapshotAt = b.syncTokenAt
+	if time.Since(b.syncSnapshotFlushAt) >= syncSnapshotFlushInterval {
+		b.syncSnapshotFlushAt = time.Now()
+		shouldFlush = true
+	}
 	b.locker.Unlock()
+	if shouldFlush {
+		b.flushSyncSnapshot()
+	}
 }
 
 func extractUID(card vcard.Card) string {
@@ -1769,6 +1863,7 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, events <-c
 		vcardVer:        vcardVersion,
 	}
 	b.loadLastServed()
+	b.loadSyncSnapshot()
 
 	if events != nil {
 		go b.receiveEvents(events)
