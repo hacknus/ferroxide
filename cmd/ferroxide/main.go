@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
-	"crypto/sha256"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -466,7 +464,7 @@ func writeContactsPropfindResponse(resp http.ResponseWriter, req *http.Request, 
 	_, _ = resp.Write(b.Bytes())
 }
 
-func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) {
+func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, backend webdavcarddav.Backend) int {
 	body, _ := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -483,6 +481,19 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 	}
 	if debug {
 		log.Printf("carddav/report: path=%s type=%s hrefs=%d wantEtag=%t wantData=%t syncToken=%q body=%q", req.URL.Path, report.reportType, len(report.hrefs), report.wantETag, report.wantAddressData, report.syncToken, string(body))
+	}
+
+	if report.reportType == "sync-collection" && report.syncToken != "" {
+		type syncTokenValidator interface {
+			IsSyncTokenValid(token string) bool
+		}
+		if mgr, ok := backend.(syncTokenValidator); ok && !mgr.IsSyncTokenValid(report.syncToken) {
+			resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			resp.WriteHeader(http.StatusForbidden)
+			_, _ = resp.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
+				`<D:error xmlns:D="DAV:"><D:valid-sync-token/></D:error>`))
+			return http.StatusForbidden
+		}
 	}
 
 	resp.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -567,7 +578,7 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 		objects, err = backend.ListAddressObjects(req.Context(), "/contacts/", &webdavcarddav.AddressDataRequest{AllProp: true})
 		if err != nil {
 			resp.WriteHeader(http.StatusInternalServerError)
-			return
+			return http.StatusInternalServerError
 		}
 		if debug {
 			log.Printf("carddav/report: returned %d contacts", len(objects))
@@ -596,7 +607,7 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 			// so include full address-data in sync-collection responses.
 			report.wantAddressData = true
 
-			syncToken = syncTokenFromObjects(objects)
+			syncToken = ferrocarddav.SyncTokenFromObjects(objects)
 			var deletions []string
 			if report.syncToken != "" && validToken {
 				if report.syncToken == syncToken {
@@ -653,26 +664,7 @@ func writeCarddavReportResponse(resp http.ResponseWriter, req *http.Request, bac
 
 	b.WriteString(`</D:multistatus>`)
 	_, _ = resp.Write(b.Bytes())
-}
-
-func syncTokenFromObjects(objects []webdavcarddav.AddressObject) string {
-	if len(objects) == 0 {
-		return "token-empty"
-	}
-	ordered := make([]webdavcarddav.AddressObject, len(objects))
-	copy(ordered, objects)
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].Path == ordered[j].Path {
-			return ordered[i].ETag < ordered[j].ETag
-		}
-		return ordered[i].Path < ordered[j].Path
-	})
-	h := sha256.New()
-	for _, obj := range ordered {
-		_, _ = h.Write([]byte(obj.Path))
-		_, _ = h.Write([]byte(obj.ETag))
-	}
-	return fmt.Sprintf("token-%x", h.Sum(nil))
+	return http.StatusMultiStatus
 }
 
 type carddavReport struct {
@@ -1041,9 +1033,9 @@ func listenAndServeCardDAV(addr string, debug bool, authManager *auth.Manager, e
 			if req.Method == "REPORT" && (req.URL.Path == "/contacts/" || req.URL.Path == "/contacts/default/") {
 				handler, ok := h.(*webdavcarddav.Handler)
 				if ok {
-					writeCarddavReportResponse(resp, req, handler.Backend)
+					status := writeCarddavReportResponse(resp, req, handler.Backend)
 					if debug {
-						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, http.StatusMultiStatus)
+						log.Printf("carddav/http: %s %s -> %d", req.Method, req.URL.Path, status)
 					}
 					return
 				}
