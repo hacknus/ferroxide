@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"encoding/xml"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/acheong08/ferroxide/protonmail"
@@ -677,12 +678,45 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "PROPPATCH" {
+		if h.handlePropPatch(w, r) {
+			return
+		}
+	}
 	if r.Method == http.MethodPost {
 		if h.handlePost(w, r) {
 			return
 		}
 	}
 	h.inner.ServeHTTP(w, r)
+}
+
+func (h *handler) handlePropPatch(w http.ResponseWriter, r *http.Request) bool {
+	homeSetPath, err := h.backend.CalendarHomeSetPath(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return true
+	}
+	if !strings.HasPrefix(r.URL.Path, homeSetPath) || strings.HasSuffix(r.URL.Path, ".ics") {
+		return false
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return true
+	}
+
+	props := parsePropPatchProps(body)
+	if len(props) == 0 {
+		props = []xml.Name{{Space: "DAV:", Local: "displayname"}}
+	}
+
+	response := buildPropPatchResponse(r.URL.Path, props)
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(207)
+	_, _ = w.Write(response)
+	return true
 }
 
 func (h *handler) handlePost(w http.ResponseWriter, r *http.Request) bool {
@@ -734,6 +768,114 @@ func (h *handler) handlePost(w http.ResponseWriter, r *http.Request) bool {
 	}
 	w.WriteHeader(http.StatusCreated)
 	return true
+}
+
+func parsePropPatchProps(body []byte) []xml.Name {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	var props []xml.Name
+	inProp := false
+	propDepth := 0
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return props
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if !inProp && t.Name.Local == "prop" {
+				inProp = true
+				propDepth = 0
+				continue
+			}
+			if inProp {
+				if propDepth == 0 {
+					props = append(props, t.Name)
+				}
+				propDepth++
+			}
+		case xml.EndElement:
+			if inProp {
+				if propDepth > 0 {
+					propDepth--
+				}
+				if propDepth == 0 && t.Name.Local == "prop" {
+					inProp = false
+				}
+			}
+		}
+	}
+
+	return props
+}
+
+func buildPropPatchResponse(href string, props []xml.Name) []byte {
+	prefixes := map[string]string{
+		"DAV:":                         "D",
+		"urn:ietf:params:xml:ns:caldav": "C",
+		"http://calendarserver.org/ns/": "CS",
+		"http://apple.com/ns/ical/":     "ICAL",
+	}
+
+	used := map[string]string{
+		"DAV:": "D",
+	}
+	next := 1
+	for _, p := range props {
+		ns := p.Space
+		if ns == "" {
+			ns = "DAV:"
+		}
+		if _, ok := used[ns]; ok {
+			continue
+		}
+		if pref, ok := prefixes[ns]; ok {
+			used[ns] = pref
+			continue
+		}
+		used[ns] = fmt.Sprintf("NS%d", next)
+		next++
+	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+	b.WriteString("<D:multistatus")
+	for ns, pref := range used {
+		b.WriteString(" xmlns:")
+		b.WriteString(pref)
+		b.WriteString(`="`)
+		b.WriteString(ns)
+		b.WriteString(`"`)
+	}
+	b.WriteString(">")
+
+	b.WriteString("<D:response><D:href>")
+	escapeXML(&b, href)
+	b.WriteString("</D:href><D:propstat><D:prop>")
+	for _, p := range props {
+		ns := p.Space
+		if ns == "" {
+			ns = "DAV:"
+		}
+		pref := used[ns]
+		b.WriteString("<")
+		b.WriteString(pref)
+		b.WriteString(":")
+		b.WriteString(p.Local)
+		b.WriteString("/>")
+	}
+	b.WriteString("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>")
+	b.WriteString("</D:multistatus>")
+	return []byte(b.String())
+}
+
+func escapeXML(b *strings.Builder, s string) {
+	var buf bytes.Buffer
+	_ = xml.EscapeText(&buf, []byte(s))
+	b.WriteString(buf.String())
 }
 
 func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username string, events <-chan *protonmail.Event) http.Handler {
