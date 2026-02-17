@@ -33,4 +33,9 @@ if [ ! -f ~/.config/ferroxide/auth.json ]; then
 
 fi
 
-./ferroxide serve
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+./ferroxide serve \
+  -smtp-host "${BIND_ADDR}" \
+  -imap-host "${BIND_ADDR}" \
+  -carddav-host "${BIND_ADDR}" \
+  -caldav-host "${BIND_ADDR}"
