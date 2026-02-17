@@ -5,8 +5,8 @@
 
 # Prefer args, fall back to environment variables.
 USER_ARG="${1:-${USERNAME}}"
-PASS_ARG="${2:-${PASSWORD}}"
-TOKEN_ARG="${3:-${TOKEN}}"
+PASS_ARG="${2:-${FERROXIDE_LOGIN_PASS:-${PASSWORD}}}"
+TOKEN_ARG="${3:-${FERROXIDE_TOTP:-${TOKEN}}}"
 
 # If access token already exists, simply start serving.
 if [ ! -f ~/.config/ferroxide/auth.json ]; then
