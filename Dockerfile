@@ -1,12 +1,12 @@
 
 # The intention was to stop pulling all these module dependencies every build but Docker doesn't seem to be able to help itself from rebuilding this first stage. May be something I can do in the command line at build time to suggest the local image copy of the finished stage.
-FROM golang:1.15.5-alpine3.12 AS dependencies
+FROM golang:1.24-alpine AS dependencies
 
 ADD . /src
 WORKDIR /src
 RUN go get ./cmd/ferroxide
 
-FROM golang:1.15.5-alpine3.12 AS compilation
+FROM golang:1.24-alpine AS compilation
 
 COPY --from=dependencies /go /go
 ADD . /src
