@@ -6,27 +6,30 @@
 # If access token already exists, simply start serving.
 if [ ! -f ~/.config/ferroxide/auth.json ]; then
 
-  if [ $# -ne 3 ]; then
+  if [ $# -lt 2 ] || [ $# -gt 3 ]; then
     printf "Incorrect argument count.\n"
     printf "Please provide:\n1) Username\n2) Password\n3) Two factor token\n"
     exit 1
   fi
 
-# If token length checks out, attempt authentication for access token creation and storage.
-  if [ ${#3} -eq 6 ]; then
-    printf "%s\n%s\n" "${2}" "${3}" | ./ferroxide auth "${1}"
-
-    if [ $? -ne 0 ]; then
-      printf "Authentication failed. Exiting.\n"
-      exit 2
+  # If a token was provided, it must be 6 digits. Otherwise, proceed without 2FA.
+  if [ $# -eq 3 ] && [ -n "${3}" ]; then
+    if [ ${#3} -ne 6 ]; then
+      printf "Two factor auth token is not the correct length. Exiting.\n"
+      exit 3
     fi
 
-    printf "Authentication successful.\n"
-
+    printf "%s\n%s\n" "${2}" "${3}" | ./ferroxide auth "${1}"
   else
-    printf "Two factor auth token is not the correct length. Exiting.\n"
-    exit 3
+    printf "%s\n" "${2}" | ./ferroxide auth "${1}"
   fi
+
+  if [ $? -ne 0 ]; then
+    printf "Authentication failed. Exiting.\n"
+    exit 2
+  fi
+
+  printf "Authentication successful.\n"
 
 fi
 
