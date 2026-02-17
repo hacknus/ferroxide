@@ -37,4 +37,4 @@ COPY entrypoint.sh .
 EXPOSE 1025 1143 8083
 
 # This is some nonsense due to variable substitution and executing commands without shell sessions
-ENTRYPOINT [ "/bin/sh", "-c", "/ferroxide/entrypoint.sh ${USERNAME} ${PASSWORD} ${TOKEN}" ]
+ENTRYPOINT [ "/ferroxide/entrypoint.sh" ]
