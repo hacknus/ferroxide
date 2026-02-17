@@ -38,7 +38,7 @@ if [ ! -f ~/.config/ferroxide/auth.json ]; then
 
 fi
 
-BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 ./ferroxide serve \
   -smtp-host "${BIND_ADDR}" \
   -imap-host "${BIND_ADDR}" \
