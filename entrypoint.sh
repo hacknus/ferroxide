@@ -9,6 +9,7 @@ PASS_ARG="${2:-${FERROXIDE_LOGIN_PASS:-${PASSWORD}}}"
 TOKEN_ARG="${3:-${FERROXIDE_TOTP:-${TOKEN}}}"
 
 # If access token already exists, simply start serving.
+printf "Resolved USER=%s PASS=%s TOKEN=%s\n" "${USER_ARG}" "${PASS_ARG:+***}" "${TOKEN_ARG:+***}"
 if [ ! -f ~/.config/ferroxide/auth.json ]; then
 
   if [ -z "${USER_ARG}" ] || [ -z "${PASS_ARG}" ]; then
