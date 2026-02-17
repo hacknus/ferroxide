@@ -14,6 +14,7 @@ WORKDIR /src
 
 # The Go111Module flag doesn't appear to be necessary. Could also separate out the other flags for legibility.
 ENV GO111MODULE=on
+RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ferroxide ./cmd/ferroxide
 
 FROM alpine:3.12.2 as run
