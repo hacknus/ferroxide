@@ -417,7 +417,11 @@ func main() {
 
 		var loginPassword string
 		if a == nil {
-			if pass, err := askPass("Password"); err != nil {
+			if v := os.Getenv("FERROXIDE_LOGIN_PASS"); v != "" {
+				loginPassword = v
+			} else if v := os.Getenv("PASSWORD"); v != "" {
+				loginPassword = v
+			} else if pass, err := askPass("Password"); err != nil {
 				log.Fatal(err)
 			} else {
 				loginPassword = string(pass)
@@ -438,10 +442,16 @@ func main() {
 					log.Fatal("Only TOTP is supported as a 2FA method")
 				}
 
-				scanner := bufio.NewScanner(os.Stdin)
-				fmt.Printf("2FA TOTP code: ")
-				scanner.Scan()
-				code := scanner.Text()
+				code := os.Getenv("FERROXIDE_TOTP")
+				if code == "" {
+					code = os.Getenv("TOKEN")
+				}
+				if code == "" {
+					scanner := bufio.NewScanner(os.Stdin)
+					fmt.Printf("2FA TOTP code: ")
+					scanner.Scan()
+					code = scanner.Text()
+				}
 
 				scope, err := c.AuthTOTP(code)
 				if err != nil {
@@ -460,7 +470,9 @@ func main() {
 			if a.PasswordMode == protonmail.PasswordTwo {
 				prompt = "Mailbox password"
 			}
-			if pass, err := askPass(prompt); err != nil {
+			if v := os.Getenv("FERROXIDE_MAILBOX_PASS"); v != "" {
+				mailboxPassword = v
+			} else if pass, err := askPass(prompt); err != nil {
 				log.Fatal(err)
 			} else {
 				mailboxPassword = string(pass)
