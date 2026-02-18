@@ -678,6 +678,11 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Avoid GET/HEAD on /caldav/ causing GetCalendarObject errors.
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && (r.URL.Path == "/caldav" || r.URL.Path == "/caldav/") {
+		http.Redirect(w, r, "/caldav/calendars/", http.StatusTemporaryRedirect)
+		return
+	}
 	if r.Method == "PROPPATCH" {
 		if h.handlePropPatch(w, r) {
 			return
