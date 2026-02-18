@@ -41,7 +41,12 @@ fi
 
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 printf "Using BIND_ADDR=%s\n" "${BIND_ADDR}"
-./ferroxide \
+DEBUG_FLAG=""
+if [ "${FERROXIDE_DEBUG}" = "1" ] || [ "${FERROXIDE_DEBUG}" = "true" ]; then
+  DEBUG_FLAG="-debug"
+fi
+
+./ferroxide ${DEBUG_FLAG} \
   -smtp-host "${BIND_ADDR}" \
   -imap-host "${BIND_ADDR}" \
   -carddav-host "${BIND_ADDR}" \
