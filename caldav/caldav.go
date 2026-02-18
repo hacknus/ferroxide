@@ -31,6 +31,9 @@ type backend struct {
 	uidToID     map[string]string
 }
 
+var errMissingCalendarKeys = errors.New("calendar keys unavailable")
+var errNoReadableEventData = errors.New("no readable event data")
+
 func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 	// TODO
 }
@@ -40,6 +43,9 @@ func (b *backend) CreateCalendar(ctx context.Context, calendar *caldav.Calendar)
 }
 
 func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, userKr openpgp.KeyRing, calKr openpgp.KeyRing, keyPacket string) (ical.Props, error) {
+	if eventCard.Type.Encrypted() && isEmptyKeyRing(calKr) {
+		return nil, errMissingCalendarKeys
+	}
 	md, err := eventCard.Read(userKr, calKr, keyPacket)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/readEventCard: error reading event card: (%w)", err)
@@ -85,9 +91,14 @@ func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, us
 func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, calKr openpgp.KeyRing) (*ical.Calendar, error) {
 	merged := ical.NewEvent()
 	calProps := ical.Props{}
+	skippedEncrypted := false
 	// TODO: handle AttendeesEvents and PersonalEvents
 	for _, card := range event.SharedEvents {
 		if propsMap, err := readEventCard(merged, card, userKr, calKr, event.SharedKeyPacket); err != nil {
+			if errors.Is(err, errMissingCalendarKeys) {
+				skippedEncrypted = true
+				continue
+			}
 			return nil, fmt.Errorf("caldav/toIcalCalendar: error reading shared event card: (%w)", err)
 		} else {
 			for name := range propsMap {
@@ -98,12 +109,23 @@ func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, cal
 
 	for _, card := range event.CalendarEvents {
 		if propsMap, err := readEventCard(merged, card, userKr, calKr, event.CalendarKeyPacket); err != nil {
+			if errors.Is(err, errMissingCalendarKeys) {
+				skippedEncrypted = true
+				continue
+			}
 			return nil, fmt.Errorf("caldav/toIcalCalendar: error reading calendar event card: (%w)", err)
 		} else {
 			for name := range propsMap {
 				calProps.Set(propsMap.Get(name))
 			}
 		}
+	}
+
+	if len(merged.Props) == 0 {
+		if skippedEncrypted {
+			return nil, errNoReadableEventData
+		}
+		return nil, fmt.Errorf("caldav/toIcalCalendar: empty event")
 	}
 
 	for _, notification := range event.Notifications {
@@ -133,6 +155,30 @@ func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, cal
 	cal.Children = append(cal.Children, merged.Component)
 
 	return cal, nil
+}
+
+func isEmptyKeyRing(kr openpgp.KeyRing) bool {
+	if kr == nil {
+		return true
+	}
+	if el, ok := kr.(openpgp.EntityList); ok {
+		return len(el) == 0
+	}
+	return false
+}
+
+func decryptCalendarKeyring(bootstrap *protonmail.CalendarBootstrap, userKr openpgp.KeyRing) (openpgp.KeyRing, bool, error) {
+	calKr, err := bootstrap.DecryptKeyring(userKr)
+	if err != nil {
+		if errors.Is(err, protonmail.ErrCalendarNoMemberKey) {
+			return openpgp.EntityList{}, false, nil
+		}
+		return nil, false, err
+	}
+	if isEmptyKeyRing(calKr) {
+		return openpgp.EntityList{}, false, nil
+	}
+	return calKr, true, nil
 }
 
 func getCalendarObject(b *backend, calId string, calKr openpgp.KeyRing, event *protonmail.CalendarEvent, settings protonmail.CalendarSettings) (*caldav.CalendarObject, error) {
@@ -256,6 +302,17 @@ func parseCalendarEventIDs(path, homeSetPath string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+func pickCalendarView(cal *protonmail.Calendar, kr openpgp.KeyRing) (*protonmail.CalendarMemberView, bool) {
+	if mv, err := protonmail.FindMemberViewFromKeyring(cal.Members, kr); err == nil {
+		return mv, true
+	}
+	if len(cal.Members) == 0 {
+		return nil, false
+	}
+	fallback := cal.Members[0]
+	return &fallback, false
+}
+
 func (b *backend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) {
 	protonCals, err := b.c.ListCalendars()
 	if err != nil {
@@ -269,15 +326,9 @@ func (b *backend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) 
 
 	var cals []caldav.Calendar
 	for _, cal := range protonCals {
-		calView, err := protonmail.FindMemberViewFromKeyring(cal.Members, b.privateKeys)
-		if err != nil {
-			continue // Skip calendars we don't have access to
-		}
-
-		// Skip special calendars that lack proper encryption/author info
-		name := strings.ToLower(calView.Name)
-		if strings.Contains(name, "birthday") || strings.Contains(name, "holiday") {
-			continue
+		calView, _ := pickCalendarView(cal, b.privateKeys)
+		if calView == nil {
+			continue // Skip calendars we truly can't read
 		}
 
 		caldavCal := caldav.Calendar{
@@ -310,14 +361,9 @@ func (b *backend) GetCalendar(ctx context.Context, path string) (*caldav.Calenda
 			continue
 		}
 
-		calView, err := protonmail.FindMemberViewFromKeyring(cal.Members, b.privateKeys)
-		if err != nil {
-			return nil, fmt.Errorf("caldav/GetCalendar: error finding member view for calendar %s: (%w)", cal.ID, err)
-		}
-
-		name := strings.ToLower(calView.Name)
-		if strings.Contains(name, "birthday") || strings.Contains(name, "holiday") {
-			return nil, fmt.Errorf("caldav/GetCalendar: calendar %s is a special calendar and not supported", calView.Name)
+		calView, _ := pickCalendarView(cal, b.privateKeys)
+		if calView == nil {
+			return nil, fmt.Errorf("caldav/GetCalendar: could not resolve member view for calendar %s", cal.ID)
 		}
 
 		caldavCal := caldav.Calendar{
@@ -378,9 +424,12 @@ func (b *backend) GetCalendarObject(ctx context.Context, path string, req *calda
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error bootstrapping calendar (calId: %s): (%w)", calId, err)
 	}
 
-	calKr, err := bootstrap.DecryptKeyring(b.privateKeys)
+	calKr, hasKeys, err := decryptCalendarKeyring(bootstrap, b.privateKeys)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error decrypting keyring: (%w)", err)
+	}
+	if !hasKeys {
+		log.Printf("caldav/GetCalendarObject: calendar %s has no member key; serving read-only unencrypted data", calId)
 	}
 
 	co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
@@ -414,10 +463,13 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error bootstrapping calendar (calId: %s): (%w)", calId, err)
 	}
 
-	calKr, err := bootstrap.DecryptKeyring(b.privateKeys)
+	calKr, hasKeys, err := decryptCalendarKeyring(bootstrap, b.privateKeys)
 	if err != nil {
 		log.Printf("caldav/ListCalendarObjects: error decrypting keyring: %v", err)
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error decrypting keyring: (%w)", err)
+	}
+	if !hasKeys {
+		log.Printf("caldav/ListCalendarObjects: calendar %s has no member key; serving read-only unencrypted data", calId)
 	}
 
 	var cos []caldav.CalendarObject
@@ -469,19 +521,26 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error bootstrapping calendar (calId: %s): (%w)", calId, err)
 	}
 
-	calKr, err := bootstrap.DecryptKeyring(b.privateKeys)
+	calKr, hasKeys, err := decryptCalendarKeyring(bootstrap, b.privateKeys)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error decrypting keyring: (%w)", err)
 	}
+	if !hasKeys {
+		log.Printf("caldav/QueryCalendarObjects: calendar %s has no member key; serving read-only unencrypted data", calId)
+	}
 
-	cos := make([]caldav.CalendarObject, len(events))
+	var cos []caldav.CalendarObject
 	for i, event := range events {
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
+			if errors.Is(err, errNoReadableEventData) {
+				log.Printf("caldav/QueryCalendarObjects: skipping event %d (ID: %s) due to unreadable data", i, event.ID)
+				continue
+			}
 			return nil, fmt.Errorf("caldav/QueryCalendarObjects: error creating calendar object for event %d: (%w)", i, err)
 		}
 
-		cos[i] = *co
+		cos = append(cos, *co)
 	}
 
 	return cos, nil

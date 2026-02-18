@@ -21,6 +21,10 @@ import (
 
 const calendarPath = "/calendar/v1"
 
+// ErrCalendarNoMemberKey indicates the current user does not have a member key
+// (or passphrase) for the calendar, so decryption isn't possible.
+var ErrCalendarNoMemberKey = errors.New("calendar has no member key for user")
+
 type CalendarFlags int
 
 type Calendar struct {
@@ -206,7 +210,7 @@ func (bootstrap *CalendarBootstrap) DecryptKeyring(userKr openpgp.KeyRing) (open
 
 		member, err := FindMemberViewFromKeyring(bootstrap.Members, userKr)
 		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: failed to find member view: (%w)", err)
+			return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
 		}
 
 		for _, _passphrase := range bootstrap.Passphrase.MemberPassphrases {
@@ -216,7 +220,7 @@ func (bootstrap *CalendarBootstrap) DecryptKeyring(userKr openpgp.KeyRing) (open
 			}
 		}
 		if passphrase == nil {
-			return nil, fmt.Errorf("DecryptKeyring: could not find MemberPassphrase for MemberID: %s", member.ID)
+			return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
 		}
 
 		passphraseEnc, err := armor.Decode(strings.NewReader(passphrase.Passphrase))
