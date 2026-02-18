@@ -677,10 +677,33 @@ type handler struct {
 	inner   *caldav.Handler
 }
 
+func writeCollectionStatus(w http.ResponseWriter, href string) {
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(207)
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:">
+  <response>
+    <href>%s</href>
+    <propstat>
+      <prop></prop>
+      <status>HTTP/1.1 200 OK</status>
+    </propstat>
+  </response>
+</multistatus>`, href)
+	_, _ = w.Write([]byte(body))
+}
+
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Avoid GET/HEAD on /caldav/ causing GetCalendarObject errors.
-	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && (r.URL.Path == "/caldav" || r.URL.Path == "/caldav/") {
-		http.Redirect(w, r, "/caldav/calendars/", http.StatusTemporaryRedirect)
+	// Avoid GET/HEAD on collection paths causing GetCalendarObject errors.
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if r.URL.Path == "/caldav" || r.URL.Path == "/caldav/" {
+			writeCollectionStatus(w, "/caldav/")
+			return
+		}
+		if r.URL.Path == "/caldav/calendars" || r.URL.Path == "/caldav/calendars/" {
+			writeCollectionStatus(w, "/caldav/calendars/")
+			return
+		}
 		return
 	}
 	if r.Method == "PROPPATCH" {
