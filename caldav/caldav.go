@@ -806,18 +806,18 @@ func writeDiscoveryStatus(w http.ResponseWriter, href string, homeSet string) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(207)
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<multistatus xmlns="DAV:">
-  <response>
-    <href>%s</href>
-    <propstat>
-      <prop>
-        <current-user-principal><href>/caldav/</href></current-user-principal>
-        <calendar-home-set xmlns="urn:ietf:params:xml:ns:caldav"><href>%s</href></calendar-home-set>
-      </prop>
-      <status>HTTP/1.1 200 OK</status>
-    </propstat>
-  </response>
-</multistatus>`, href, homeSet)
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>%s</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:current-user-principal><D:href>/caldav/</D:href></D:current-user-principal>
+        <C:calendar-home-set><D:href>%s</D:href></C:calendar-home-set>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`, href, homeSet)
 	_, _ = w.Write([]byte(body))
 }
 
