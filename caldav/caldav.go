@@ -740,6 +740,52 @@ type handler struct {
 	inner   *caldav.Handler
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.status = code
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusRecorder) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func shouldLogRequest(r *http.Request, status int) bool {
+	if status >= 400 {
+		return true
+	}
+	path := r.URL.Path
+	switch r.Method {
+	case "PROPFIND", "REPORT", "OPTIONS":
+		return path == "/" || strings.HasPrefix(path, "/caldav")
+	case "MKCALENDAR", "PUT", "DELETE", "PROPPATCH", "POST":
+		return true
+	default:
+		return false
+	}
+}
+
+func logRequest(r *http.Request, status int, dur time.Duration) {
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if !shouldLogRequest(r, status) {
+		return
+	}
+	ua := r.Header.Get("User-Agent")
+	depth := r.Header.Get("Depth")
+	log.Printf("caldav/http: %s %s -> %d (%s) depth=%q ua=%q", r.Method, r.URL.Path, status, dur, depth, ua)
+}
+
 func writeCollectionStatus(w http.ResponseWriter, href string) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(207)
@@ -791,8 +837,37 @@ func writeNeedPrivileges(w http.ResponseWriter, href string) {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rec := &statusRecorder{ResponseWriter: w}
+	start := time.Now()
+	defer func() {
+		logRequest(r, rec.status, time.Since(start))
+	}()
+	w = rec
+
+	// Well-known CalDAV/CardDAV discovery.
+	if r.URL.Path == "/.well-known/caldav" {
+		http.Redirect(w, r, "/caldav/", http.StatusMovedPermanently)
+		return
+	}
+	if r.URL.Path == "/.well-known/carddav" {
+		http.Redirect(w, r, "/carddav/", http.StatusMovedPermanently)
+		return
+	}
+
+	// Answer OPTIONS on root with DAV headers.
+	if r.Method == http.MethodOptions && r.URL.Path == "/" {
+		w.Header().Set("DAV", "1, 2, calendar-access")
+		w.Header().Set("Allow", "OPTIONS, PROPFIND, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE, PROPPATCH")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Avoid GET/HEAD on collection paths causing GetCalendarObject errors.
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if r.URL.Path == "/" {
+			writeDiscoveryStatus(w, "/", "/caldav/calendars/")
+			return
+		}
 		if r.URL.Path == "/caldav" || r.URL.Path == "/caldav/" {
 			writeDiscoveryStatus(w, "/caldav/", "/caldav/calendars/")
 			return
@@ -802,6 +877,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		return
+	}
+	if r.Method == "PROPFIND" {
+		if r.URL.Path == "/" {
+			writeDiscoveryStatus(w, "/", "/caldav/calendars/")
+			return
+		}
 	}
 	if r.Method == "MKCALENDAR" {
 		parent := path.Dir(r.URL.Path)
