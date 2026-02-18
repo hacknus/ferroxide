@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 	"encoding/xml"
+	"path"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/acheong08/ferroxide/protonmail"
@@ -434,6 +435,9 @@ func (b *backend) GetCalendarObject(ctx context.Context, path string, req *calda
 
 	co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 	if err != nil {
+		if errors.Is(err, errNoReadableEventData) {
+			return nil, webdav.NewHTTPError(http.StatusNotFound, errors.New("calendar event not found"))
+		}
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error creating calendar object: (%w)", err)
 	}
 
@@ -771,6 +775,21 @@ func writeDiscoveryStatus(w http.ResponseWriter, href string, homeSet string) {
 	_, _ = w.Write([]byte(body))
 }
 
+func writeNeedPrivileges(w http.ResponseWriter, href string) {
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<D:error xmlns:D="DAV:">
+  <D:need-privileges>
+    <D:resource>
+      <D:href>%s</D:href>
+      <D:privilege><D:bind/></D:privilege>
+    </D:resource>
+  </D:need-privileges>
+</D:error>`, href)
+	_, _ = w.Write([]byte(body))
+}
+
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Avoid GET/HEAD on collection paths causing GetCalendarObject errors.
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
@@ -782,6 +801,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeCollectionStatus(w, "/caldav/calendars/")
 			return
 		}
+		return
+	}
+	if r.Method == "MKCALENDAR" {
+		parent := path.Dir(r.URL.Path)
+		if !strings.HasSuffix(parent, "/") {
+			parent += "/"
+		}
+		writeNeedPrivileges(w, parent)
 		return
 	}
 	if r.Method == "PROPPATCH" {

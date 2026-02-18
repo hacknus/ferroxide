@@ -204,69 +204,74 @@ func FindMemberViewFromKeyring(members []CalendarMemberView, kr openpgp.KeyRing)
 }
 
 func (bootstrap *CalendarBootstrap) DecryptKeyring(userKr openpgp.KeyRing) (openpgp.KeyRing, error) {
-	var calKr openpgp.EntityList
-	for _, key := range bootstrap.Keys {
-		var passphrase *CalendarMemberPassphrase
-
-		member, err := FindMemberViewFromKeyring(bootstrap.Members, userKr)
+	passphraseCandidates := make([][]byte, 0, len(bootstrap.Passphrase.MemberPassphrases))
+	for _, mp := range bootstrap.Passphrase.MemberPassphrases {
+		passphraseEnc, err := armor.Decode(strings.NewReader(mp.Passphrase))
 		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
-		}
-
-		for _, _passphrase := range bootstrap.Passphrase.MemberPassphrases {
-			if _passphrase.MemberID == member.ID {
-				passphrase = &_passphrase
-				break
-			}
-		}
-		if passphrase == nil {
-			return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
-		}
-
-		passphraseEnc, err := armor.Decode(strings.NewReader(passphrase.Passphrase))
-		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: failed to decode passphrase: (%w)", err)
+			continue
 		}
 
 		md, err := openpgp.ReadMessage(passphraseEnc.Body, userKr, nil, nil)
 		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: failed to read message: (%w)", err)
+			continue
 		}
 
 		passphraseBytes, err := io.ReadAll(md.UnverifiedBody)
 		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: failed to read passphrase body: (%w)", err)
+			continue
 		}
 
-		/*		signatureData, err := armor.Decode(strings.NewReader(passphrase.Signature))
-				if err != nil {
-					return nil, err
-				}
-				_, err = openpgp.CheckArmoredDetachedSignature(userKr, bytes.NewReader(passphraseBytes), signatureData.Body, nil)
-				if err != nil {
-					return nil, err
-				}*/
+		passphraseCandidates = append(passphraseCandidates, passphraseBytes)
+	}
+	if len(passphraseCandidates) == 0 {
+		return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
+	}
 
-		keyKr, err := openpgp.ReadArmoredKeyRing(strings.NewReader(key.PrivateKey))
-		if err != nil {
-			return nil, fmt.Errorf("DecryptKeyring: failed to read armored key ring: (%w)", err)
-		}
-
-		for _, calKey := range keyKr {
-			err = calKey.PrivateKey.Decrypt(passphraseBytes)
+	var calKr openpgp.EntityList
+	for _, key := range bootstrap.Keys {
+		decrypted := false
+		for _, passphraseBytes := range passphraseCandidates {
+			keyKr, err := openpgp.ReadArmoredKeyRing(strings.NewReader(key.PrivateKey))
 			if err != nil {
-				return nil, fmt.Errorf("DecryptKeyring: failed to decrypt private key: (%w)", err)
+				return nil, fmt.Errorf("DecryptKeyring: failed to read armored key ring: (%w)", err)
 			}
 
-			for _, subKey := range calKey.Subkeys {
-				err := subKey.PrivateKey.Decrypt(passphraseBytes)
-				if err != nil {
-					return nil, fmt.Errorf("DecryptKeyring: failed to decrypt subkey: (%w)", err)
+			ok := true
+			for _, calKey := range keyKr {
+				if calKey.PrivateKey != nil {
+					if err := calKey.PrivateKey.Decrypt(passphraseBytes); err != nil {
+						ok = false
+						break
+					}
+				}
+
+				for _, subKey := range calKey.Subkeys {
+					if subKey.PrivateKey == nil {
+						continue
+					}
+					if err := subKey.PrivateKey.Decrypt(passphraseBytes); err != nil {
+						ok = false
+						break
+					}
+				}
+				if !ok {
+					break
 				}
 			}
+
+			if !ok {
+				continue
+			}
+
+			// Successfully decrypted with this passphrase.
+			calKr = append(calKr, keyKr...)
+			decrypted = true
+			break
 		}
 
-		calKr = append(calKr, keyKr...)
+		if !decrypted {
+			return nil, fmt.Errorf("DecryptKeyring: %w", ErrCalendarNoMemberKey)
+		}
 	}
 	return calKr, nil
 }
