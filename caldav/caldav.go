@@ -575,33 +575,57 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 	reqResourceID := evtId
 
 	events := calendar.Events()
-	if len(events) != 1 {
-		return nil, fmt.Errorf("caldav/PutCalendarObject: expected PUT VCALENDAR to have exactly one VEVENT")
+	if len(events) == 0 {
+		return nil, fmt.Errorf("caldav/PutCalendarObject: expected PUT VCALENDAR to have at least one VEVENT")
 	}
-	event := events[0]
+	if len(events) > 1 {
+		log.Printf("caldav/PutCalendarObject: multi-VEVENT PUT, count=%d; creating events individually", len(events))
+		var first *caldav.CalendarObject
+		for i, ev := range events {
+			resourceHint := ""
+			if i == 0 {
+				resourceHint = reqResourceID
+			}
+			co, err := b.putSingleCalendarEvent(calId, resourceHint, homeSetPath, calendar, ev)
+			if err != nil {
+				return nil, fmt.Errorf("caldav/PutCalendarObject: error creating event %d: (%w)", i, err)
+			}
+			if first == nil {
+				first = co
+			}
+		}
+		if first == nil {
+			return nil, fmt.Errorf("caldav/PutCalendarObject: no events created")
+		}
+		return first, nil
+	}
+	return b.putSingleCalendarEvent(calId, reqResourceID, homeSetPath, calendar, events[0])
+}
 
+func (b *backend) putSingleCalendarEvent(calId string, reqResourceID string, homeSetPath string, calendar *ical.Calendar, event ical.Event) (*caldav.CalendarObject, error) {
 	normalizeFloatingDateTimes(calendar, &event)
 
 	clientUID := ""
 	if uidProp := event.Props.Get("UID"); uidProp != nil {
 		clientUID = uidProp.Value
 	}
-	if clientUID == "" && evtId != "" {
+	if clientUID == "" && reqResourceID != "" {
 		// Preserve client-chosen resource IDs as UID when possible.
-		event.Props.SetText("UID", evtId)
-		clientUID = evtId
+		event.Props.SetText("UID", reqResourceID)
+		clientUID = reqResourceID
 	}
-	if resolved, resErr := resolveEventIDByUID(b, calId, evtId); resErr == nil {
-		evtId = resolved
-	} else if isLikelyUUID(evtId) {
-		// Treat unknown UUID resource IDs as creates; avoid passing invalid IDs to Proton.
-		evtId = ""
+
+	evtId := ""
+	if clientUID != "" {
+		if resolved, resErr := resolveEventIDByUID(b, calId, clientUID); resErr == nil {
+			evtId = resolved
+		}
 	}
 
 	newEvent, err := b.c.UpdateCalendarEvent(calId, evtId, event, b.privateKeys)
 	if err != nil {
-		log.Printf("caldav/PutCalendarObject: failed (calId: %s, evtId: %s): %v", calId, evtId, err)
-		return nil, fmt.Errorf("caldav/PutCalendarObject: error updating calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
+		log.Printf("caldav/putSingleCalendarEvent: failed (calId: %s, evtId: %s): %v", calId, evtId, err)
+		return nil, fmt.Errorf("caldav/putSingleCalendarEvent: error updating calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
 	}
 
 	resourceID := reqResourceID
@@ -614,7 +638,7 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 	if resourceID == "" {
 		resourceID = newEvent.ID
 	}
-	path = homeSetPath + calId + formatCalendarObjectPath(resourceID)
+	path := homeSetPath + calId + formatCalendarObjectPath(resourceID)
 	b.locker.Lock()
 	if newEvent.ID != "" {
 		b.uidToID[newEvent.ID] = newEvent.ID
