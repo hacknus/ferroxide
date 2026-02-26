@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -769,6 +770,7 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		return nil, "", fmt.Errorf("makeUpdateData: failed to decrypt keyring: (%w)", err)
 	}
 
+	sanitizeRRuleNoOccurrence(&event)
 	sharedPartCal, calendarPartCal := getEventParts(&event)
 	sharedPart, err := encodePart(sharedPartCal)
 	if err != nil {
@@ -1040,6 +1042,77 @@ func normalizeAlarmTrigger(event *ical.Event, trigger *ical.Prop) (string, bool)
 		return "", false
 	}
 	return formatICalDuration(dur), true
+}
+
+func sanitizeRRuleNoOccurrence(event *ical.Event) {
+	if event == nil {
+		return
+	}
+	rrule := event.Props.Get("RRULE")
+	if rrule == nil || rrule.Value == "" {
+		return
+	}
+	startProp := event.Props.Get("DTSTART")
+	if startProp == nil || startProp.Value == "" {
+		return
+	}
+	startTime, ok := parseICalDateTime(startProp.Value)
+	if !ok {
+		return
+	}
+
+	var until *time.Time
+	byday := map[time.Weekday]struct{}{}
+	parts := strings.Split(rrule.Value, ";")
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		switch key {
+		case "UNTIL":
+			if t, ok := parseICalDateTime(val); ok {
+				until = &t
+			}
+		case "BYDAY":
+			for _, token := range strings.Split(val, ",") {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					continue
+				}
+				if len(token) > 2 {
+					token = token[len(token)-2:]
+				}
+				switch strings.ToUpper(token) {
+				case "SU":
+					byday[time.Sunday] = struct{}{}
+				case "MO":
+					byday[time.Monday] = struct{}{}
+				case "TU":
+					byday[time.Tuesday] = struct{}{}
+				case "WE":
+					byday[time.Wednesday] = struct{}{}
+				case "TH":
+					byday[time.Thursday] = struct{}{}
+				case "FR":
+					byday[time.Friday] = struct{}{}
+				case "SA":
+					byday[time.Saturday] = struct{}{}
+				}
+			}
+		}
+	}
+	if until == nil || len(byday) == 0 {
+		return
+	}
+	if until.Before(startTime) || until.Equal(startTime) {
+		if _, ok := byday[startTime.Weekday()]; !ok {
+			log.Printf("sanitizeRRuleNoOccurrence: dropping RRULE (no occurrence). UID=%q DTSTART=%q RRULE=%q", event.Props.Get("UID").Value, startProp.Value, rrule.Value)
+			event.Props.Del("RRULE")
+		}
+	}
 }
 
 func isDurationString(v string) bool {
