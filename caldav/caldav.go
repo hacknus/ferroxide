@@ -3,6 +3,7 @@ package caldav
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -622,6 +623,7 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 
 func (b *backend) putSingleCalendarEvent(calId string, reqResourceID string, homeSetPath string, calendar *ical.Calendar, event ical.Event) (*caldav.CalendarObject, error) {
 	normalizeFloatingDateTimes(calendar, &event)
+	detachRecurrenceOverride(&event)
 
 	clientUID := ""
 	if uidProp := event.Props.Get("UID"); uidProp != nil {
@@ -677,6 +679,37 @@ func (b *backend) putSingleCalendarEvent(calId string, reqResourceID string, hom
 		ModTime: newEvent.ModifyTime.Time(),
 		Data:    calendar,
 	}, nil
+}
+
+func detachRecurrenceOverride(event *ical.Event) {
+	if event == nil {
+		return
+	}
+	rid := event.Props.Get("RECURRENCE-ID")
+	if rid == nil || rid.Value == "" {
+		return
+	}
+	rrule := event.Props.Get("RRULE")
+	if rrule != nil && rrule.Value != "" {
+		return
+	}
+
+	uid := ""
+	if uidProp := event.Props.Get("UID"); uidProp != nil {
+		uid = uidProp.Value
+	}
+	sum := sha1.Sum([]byte(uid + "|" + rid.Value))
+	suffix := fmt.Sprintf("%x", sum[:4])
+	newUID := uid
+	if newUID == "" {
+		newUID = uuid.NewString()
+	} else {
+		newUID = newUID + "-RID-" + suffix
+	}
+	log.Printf("caldav/putSingleCalendarEvent: detaching recurrence override UID=%q RECURRENCE-ID=%q -> UID=%q", uid, rid.Value, newUID)
+
+	event.Props.SetText("UID", newUID)
+	event.Props.Del("RECURRENCE-ID")
 }
 
 func normalizeFloatingDateTimes(cal *ical.Calendar, event *ical.Event) {
