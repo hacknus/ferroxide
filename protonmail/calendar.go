@@ -789,6 +789,7 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 	}
 
 	notifications := make([]CalendarNotification, 0)
+	seenNotifications := make(map[string]struct{})
 	for _, child := range event.Children {
 		if child.Name != ical.CompAlarm {
 			continue
@@ -812,6 +813,11 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 			continue
 		}
 
+		key := fmt.Sprintf("%d|%s", notification.Type, notification.Trigger)
+		if _, exists := seenNotifications[key]; exists {
+			continue
+		}
+		seenNotifications[key] = struct{}{}
 		notifications = append(notifications, notification)
 	}
 
