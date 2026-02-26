@@ -487,12 +487,21 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 	}
 
 	var cos []caldav.CalendarObject
+	usedPaths := make(map[string]struct{})
 	for i, event := range events {
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
 			log.Printf("caldav/ListCalendarObjects: skipping event %d (ID: %s) due to error: %v", i, event.ID, err)
 			continue
 		}
+		if _, exists := usedPaths[co.Path]; exists {
+			// Avoid duplicate hrefs when multiple events share the same UID (e.g. recurrence exceptions).
+			if event.ID != "" {
+				log.Printf("caldav/ListCalendarObjects: duplicate href %q for event ID %s; using ID-based href", co.Path, event.ID)
+				co.Path = homeSetPath + calId + formatCalendarObjectPath(event.ID)
+			}
+		}
+		usedPaths[co.Path] = struct{}{}
 		cos = append(cos, *co)
 	}
 
@@ -544,6 +553,7 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 	}
 
 	var cos []caldav.CalendarObject
+	usedPaths := make(map[string]struct{})
 	for i, event := range events {
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
@@ -553,6 +563,14 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 			}
 			return nil, fmt.Errorf("caldav/QueryCalendarObjects: error creating calendar object for event %d: (%w)", i, err)
 		}
+		if _, exists := usedPaths[co.Path]; exists {
+			// Avoid duplicate hrefs when multiple events share the same UID (e.g. recurrence exceptions).
+			if event.ID != "" {
+				log.Printf("caldav/QueryCalendarObjects: duplicate href %q for event ID %s; using ID-based href", co.Path, event.ID)
+				co.Path = homeSetPath + calId + formatCalendarObjectPath(event.ID)
+			}
+		}
+		usedPaths[co.Path] = struct{}{}
 
 		cos = append(cos, *co)
 	}
