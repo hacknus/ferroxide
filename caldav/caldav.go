@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -974,6 +975,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &statusRecorder{ResponseWriter: w}
 	start := time.Now()
 	defer func() {
+		if recov := recover(); recov != nil {
+			log.Printf("caldav/panic: %v\n%s", recov, debug.Stack())
+			http.Error(rec, "internal server error", http.StatusInternalServerError)
+		}
 		logRequest(r, rec.status, time.Since(start))
 	}()
 	w = rec
