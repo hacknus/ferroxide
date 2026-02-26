@@ -3,16 +3,16 @@ package caldav
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"time"
-	"encoding/xml"
-	"path"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/acheong08/ferroxide/protonmail"
@@ -71,7 +71,9 @@ func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, us
 	}*/
 
 	if err := md.SignatureError; err != nil {
-		return nil, fmt.Errorf("caldav/readEventCard: signature error: (%w)", err)
+		if !isIgnorableSignatureError(err) {
+			return nil, fmt.Errorf("caldav/readEventCard: signature error: (%w)", err)
+		}
 	}
 
 	children := decoded.Events()
@@ -87,6 +89,14 @@ func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, us
 	}
 
 	return decoded.Props, nil
+}
+
+func isIgnorableSignatureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown entity") || strings.Contains(msg, "unknown issuer")
 }
 
 func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, calKr openpgp.KeyRing) (*ical.Calendar, error) {
@@ -570,6 +580,8 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 	}
 	event := events[0]
 
+	normalizeFloatingDateTimes(calendar, &event)
+
 	clientUID := ""
 	if uidProp := event.Props.Get("UID"); uidProp != nil {
 		clientUID = uidProp.Value
@@ -623,6 +635,53 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 		ModTime: newEvent.ModifyTime.Time(),
 		Data:    calendar,
 	}, nil
+}
+
+func normalizeFloatingDateTimes(cal *ical.Calendar, event *ical.Event) {
+	if event == nil {
+		return
+	}
+	tzid := calendarTimezone(cal)
+	if tzid == "" || strings.EqualFold(tzid, "local") {
+		tzid = "UTC"
+	}
+	normalizePropTimezone(event.Props.Get("DTSTART"), tzid)
+	normalizePropTimezone(event.Props.Get("DTEND"), tzid)
+}
+
+func calendarTimezone(cal *ical.Calendar) string {
+	if cal == nil {
+		return ""
+	}
+	if p := cal.Props.Get("X-WR-TIMEZONE"); p != nil && p.Value != "" {
+		return p.Value
+	}
+	if p := cal.Props.Get("TZID"); p != nil && p.Value != "" {
+		return p.Value
+	}
+	return ""
+}
+
+func normalizePropTimezone(prop *ical.Prop, tzid string) {
+	if prop == nil || prop.Value == "" {
+		return
+	}
+	if strings.HasSuffix(prop.Value, "Z") {
+		return
+	}
+	if len(prop.Value) == len("20060102") {
+		return
+	}
+	if len(prop.Value) != len("20060102T150405") {
+		return
+	}
+	if prop.Params == nil {
+		prop.Params = ical.Params{}
+	}
+	if _, ok := prop.Params["TZID"]; ok {
+		return
+	}
+	prop.Params["TZID"] = []string{tzid}
 }
 
 func (b *backend) DeleteCalendarObject(ctx context.Context, path string) error {
