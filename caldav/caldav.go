@@ -473,12 +473,14 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 		log.Printf("caldav/ListCalendarObjects: error listing calendar events for calId %s: %v", calId, err)
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error listing calendar events for calId %s: (%w)", calId, err)
 	}
+	log.Printf("caldav/ListCalendarObjects: listed %d events calId=%s elapsed=%s", len(events), calId, time.Since(start))
 
 	bootstrap, err := b.c.BootstrapCalendar(calId)
 	if err != nil {
 		log.Printf("caldav/ListCalendarObjects: error bootstrapping calendar (calId: %s): %v", calId, err)
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error bootstrapping calendar (calId: %s): (%w)", calId, err)
 	}
+	log.Printf("caldav/ListCalendarObjects: bootstrap ok calId=%s elapsed=%s", calId, time.Since(start))
 
 	calKr, hasKeys, err := decryptCalendarKeyring(bootstrap, b.privateKeys)
 	if err != nil {
@@ -550,11 +552,13 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 	if err != nil {
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error listing calendar events for calId %s: (%w)", calId, err)
 	}
+	log.Printf("caldav/QueryCalendarObjects: listed %d events calId=%s elapsed=%s", len(events), calId, time.Since(start))
 
 	bootstrap, err := b.c.BootstrapCalendar(calId)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error bootstrapping calendar (calId: %s): (%w)", calId, err)
 	}
+	log.Printf("caldav/QueryCalendarObjects: bootstrap ok calId=%s elapsed=%s", calId, time.Since(start))
 
 	calKr, hasKeys, err := decryptCalendarKeyring(bootstrap, b.privateKeys)
 	if err != nil {
@@ -811,6 +815,7 @@ func resolveEventIDFromCache(b *backend, uid string) (string, bool) {
 }
 
 func resolveEventIDByUID(b *backend, calID string, uid string) (string, error) {
+	start := time.Now()
 	if uid == "" {
 		return "", fmt.Errorf("empty uid")
 	}
@@ -826,6 +831,9 @@ func resolveEventIDByUID(b *backend, calID string, uid string) (string, error) {
 	events, err := b.c.ListCalendarEvents(calID, nil)
 	if err != nil {
 		return "", err
+	}
+	if b.c != nil && b.c.Debug {
+		log.Printf("caldav/resolveEventIDByUID: listed %d events uid=%s elapsed=%s", len(events), uid, time.Since(start))
 	}
 	if b.c != nil && b.c.Debug {
 		log.Printf("caldav/resolveEventIDByUID: scanning %d events for uid=%s", len(events), uid)
@@ -866,6 +874,7 @@ func resolveEventIDByUID(b *backend, calID string, uid string) (string, error) {
 }
 
 func resolveEventIDByUIDWithHint(b *backend, calID string, uid string, hint *ical.Event) (string, error) {
+	start := time.Now()
 	if resolved, ok := resolveEventIDFromCache(b, uid); ok {
 		return resolved, nil
 	}
@@ -879,7 +888,7 @@ func resolveEventIDByUIDWithHint(b *backend, calID string, uid string, hint *ica
 			events, err := b.c.ListCalendarEvents(calID, filter)
 			if err == nil {
 				if b.c != nil && b.c.Debug {
-					log.Printf("caldav/resolveEventIDByUIDWithHint: scanning %d events for uid=%s (windowed)", len(events), uid)
+					log.Printf("caldav/resolveEventIDByUIDWithHint: scanning %d events for uid=%s (windowed) elapsed=%s", len(events), uid, time.Since(start))
 				}
 				for _, event := range events {
 					if event.ID == uid {
