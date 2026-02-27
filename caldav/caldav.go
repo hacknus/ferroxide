@@ -457,6 +457,7 @@ func (b *backend) GetCalendarObject(ctx context.Context, path string, req *calda
 }
 
 func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *caldav.CalendarCompRequest) ([]caldav.CalendarObject, error) {
+	start := time.Now()
 	homeSetPath, err := b.CalendarHomeSetPath(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error getting calendar home set path: (%w)", err)
@@ -491,10 +492,17 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 	var cos []caldav.CalendarObject
 	usedPaths := make(map[string]struct{})
 	for i, event := range events {
+		if i > 0 && i%50 == 0 {
+			log.Printf("caldav/ListCalendarObjects: progress calId=%s %d/%d elapsed=%s", calId, i, len(events), time.Since(start))
+		}
+		itemStart := time.Now()
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
 			log.Printf("caldav/ListCalendarObjects: skipping event %d (ID: %s) due to error: %v", i, event.ID, err)
 			continue
+		}
+		if dur := time.Since(itemStart); dur > 500*time.Millisecond {
+			log.Printf("caldav/ListCalendarObjects: slow event calId=%s idx=%d id=%s uid=%s dur=%s", calId, i, event.ID, event.UID, dur)
 		}
 		if _, exists := usedPaths[co.Path]; exists {
 			// Avoid duplicate hrefs when multiple events share the same UID (e.g. recurrence exceptions).
@@ -507,11 +515,13 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 		cos = append(cos, *co)
 	}
 
+	log.Printf("caldav/ListCalendarObjects: done calId=%s count=%d elapsed=%s", calId, len(cos), time.Since(start))
 	return cos, nil
 }
 
 func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *caldav.CalendarQuery) ([]caldav.CalendarObject, error) {
 	//TODO caldav backend lib inefficient for not passing query comprequest, possibly bump go-caldav but need to resolve breaking changes on carddav (would also allow create calendar support)
+	start := time.Now()
 	homeSetPath, err := b.CalendarHomeSetPath(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error getting calendar home set path: (%w)", err)
@@ -557,6 +567,10 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 	var cos []caldav.CalendarObject
 	usedPaths := make(map[string]struct{})
 	for i, event := range events {
+		if i > 0 && i%50 == 0 {
+			log.Printf("caldav/QueryCalendarObjects: progress calId=%s %d/%d elapsed=%s", calId, i, len(events), time.Since(start))
+		}
+		itemStart := time.Now()
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
 			if errors.Is(err, errNoReadableEventData) {
@@ -564,6 +578,9 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 				continue
 			}
 			return nil, fmt.Errorf("caldav/QueryCalendarObjects: error creating calendar object for event %d: (%w)", i, err)
+		}
+		if dur := time.Since(itemStart); dur > 500*time.Millisecond {
+			log.Printf("caldav/QueryCalendarObjects: slow event calId=%s idx=%d id=%s uid=%s dur=%s", calId, i, event.ID, event.UID, dur)
 		}
 		if _, exists := usedPaths[co.Path]; exists {
 			// Avoid duplicate hrefs when multiple events share the same UID (e.g. recurrence exceptions).
@@ -577,6 +594,7 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 		cos = append(cos, *co)
 	}
 
+	log.Printf("caldav/QueryCalendarObjects: done calId=%s count=%d elapsed=%s", calId, len(cos), time.Since(start))
 	return cos, nil
 }
 
