@@ -638,7 +638,7 @@ func (b *backend) putSingleCalendarEvent(calId string, reqResourceID string, hom
 
 	evtId := ""
 	if clientUID != "" {
-		if resolved, resErr := resolveEventIDByUID(b, calId, clientUID); resErr == nil {
+		if resolved, resErr := resolveEventIDByUIDWithHint(b, calId, clientUID, &event); resErr == nil {
 			evtId = resolved
 		}
 	}
@@ -845,6 +845,68 @@ func resolveEventIDByUID(b *backend, calID string, uid string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("event not found for uid %s", uid)
+}
+
+func resolveEventIDByUIDWithHint(b *backend, calID string, uid string, hint *ical.Event) (string, error) {
+	if resolved, ok := resolveEventIDFromCache(b, uid); ok {
+		return resolved, nil
+	}
+	if hint != nil {
+		if start, end, tzid, ok := eventTimeWindow(hint); ok {
+			filter := &protonmail.CalendarEventFilter{
+				Start:    protonmail.NewTimestamp(start),
+				End:      protonmail.NewTimestamp(end),
+				Timezone: tzid,
+			}
+			events, err := b.c.ListCalendarEvents(calID, filter)
+			if err == nil {
+				if b.c != nil && b.c.Debug {
+					log.Printf("caldav/resolveEventIDByUIDWithHint: scanning %d events for uid=%s (windowed)", len(events), uid)
+				}
+				for _, event := range events {
+					if event.ID == uid {
+						return event.ID, nil
+					}
+					if event.UID != "" && strings.EqualFold(event.UID, uid) {
+						b.locker.Lock()
+						b.uidToID[uid] = event.ID
+						b.locker.Unlock()
+						return event.ID, nil
+					}
+				}
+			}
+		}
+	}
+	return resolveEventIDByUID(b, calID, uid)
+}
+
+func eventTimeWindow(event *ical.Event) (time.Time, time.Time, string, bool) {
+	if event == nil {
+		return time.Time{}, time.Time{}, "", false
+	}
+	startProp := event.Props.Get("DTSTART")
+	if startProp == nil || startProp.Value == "" {
+		return time.Time{}, time.Time{}, "", false
+	}
+	start, ok := parseICalDateTime(startProp.Value)
+	if !ok {
+		return time.Time{}, time.Time{}, "", false
+	}
+	end := start.Add(24 * time.Hour)
+	if endProp := event.Props.Get("DTEND"); endProp != nil && endProp.Value != "" {
+		if t, ok := parseICalDateTime(endProp.Value); ok {
+			end = t
+		}
+	}
+	tzid := ""
+	if p := startProp.Params.Get("TZID"); p != "" {
+		tzid = p
+	}
+	if tzid == "" {
+		tzid = "UTC"
+	}
+	// Add a small buffer to catch all-day or timezone-shifted events.
+	return start.Add(-24 * time.Hour), end.Add(24 * time.Hour), tzid, true
 }
 
 func isLikelyUUID(id string) bool {
